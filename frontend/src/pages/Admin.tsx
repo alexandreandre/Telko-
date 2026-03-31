@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getApiBaseUrl } from "@/lib/api";
+import { getApiBaseUrl } from "@/lib/api.ts";
 import { supabase } from "@/integrations/supabase/client";
 import AppLayout from "@/components/AppLayout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
