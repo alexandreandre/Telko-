@@ -50,7 +50,7 @@ jobs:
 
       - name: Configurer Docker pour Artifact Registry / GCR
         run: |
-          gcloud auth configure-docker --quiet
+          gcloud auth configure-docker europe-west1-docker.pkg.dev --quiet
 
       # ---------- Backend ----------
       - id: meta-backend
@@ -58,6 +58,11 @@ jobs:
         run: |
           P="${{ vars.GCP_PROJECT_ID }}"
           echo "image=europe-west1-docker.pkg.dev/${P}/telko/telko-backend:${DEPLOY_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Login Docker à Artifact Registry
+        run: |
+          gcloud auth print-access-token | \
+            docker login -u oauth2accesstoken --password-stdin https://europe-west1-docker.pkg.dev
 
       - name: Build & push image backend
         uses: docker/build-push-action@v6
