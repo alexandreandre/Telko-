@@ -1,0 +1,208 @@
+name: Deploy Telko (Cloud Run + Qdrant + Frontend)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_REGION: ${{ vars.GCP_REGION || 'europe-west1' }}
+  BACKEND_SERVICE_NAME: ${{ vars.BACKEND_SERVICE_NAME || 'telko-backend' }}
+  QDRANT_SERVICE_NAME: ${{ vars.QDRANT_SERVICE_NAME || 'qdrant-telko' }}
+  FRONTEND_SERVICE_NAME: ${{ vars.FRONTEND_SERVICE_NAME || 'telko-frontend' }}
+
+jobs:
+  build-and-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_SHA: ${{ github.sha }}
+    outputs:
+      backend_image: ${{ steps.meta-backend.outputs.image }}
+      frontend_image: ${{ steps.meta-frontend.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GCP_PROJECT_ID requis
+        run: |
+          if [ -z "${{ vars.GCP_PROJECT_ID }}" ]; then
+            echo "::error::Variable dépôt GCP_PROJECT_ID manquante."
+            exit 1
+          fi
+
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Configurer Docker pour Artifact Registry / GCR
+        run: |
+          gcloud auth configure-docker --quiet
+
+      # ---------- Backend ----------
+      - id: meta-backend
+        name: Construire tag d'image backend
+        run: |
+          P="${{ vars.GCP_PROJECT_ID }}"
+          echo "image=gcr.io/${P}/telko-backend:${DEPLOY_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push image backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta-backend.outputs.image }}
+
+      # ---------- Frontend ----------
+      - id: meta-frontend
+        name: Construire tag d'image frontend
+        run: |
+          P="${{ vars.GCP_PROJECT_ID }}"
+          echo "image=gcr.io/${P}/telko-frontend:${DEPLOY_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push image frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          build-args: |
+            VITE_API_URL=${{ vars.VITE_API_URL }}
+          tags: ${{ steps.meta-frontend.outputs.image }}
+
+  deploy-qdrant:
+    name: Deploy Qdrant to Cloud Run
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    outputs:
+      qdrant_url: ${{ steps.get-url.outputs.url }}
+    steps:
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Deploy Qdrant service
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          service: ${{ env.QDRANT_SERVICE_NAME }}
+          region: ${{ env.GCP_REGION }}
+          image: qdrant/qdrant:latest
+          port: 6333
+
+      - id: get-url
+        name: Récupérer l'URL Cloud Run de Qdrant
+        run: |
+          URL=$(gcloud run services describe "${QDRANT_SERVICE_NAME}" \
+            --region "${GCP_REGION}" \
+            --format 'value(status.url)')
+          if [ -z "$URL" ]; then
+            echo "::error::Impossible de récupérer l'URL du service Qdrant."
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+  deploy-backend:
+    name: Deploy backend to Cloud Run
+    needs: [build-and-push, deploy-qdrant]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Secrets requis pour le backend
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ] || \
+             [ -z "$SUPABASE_URL" ] || \
+             [ -z "$SUPABASE_SERVICE_ROLE_KEY" ] || \
+             [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::Certains secrets backend sont manquants. Vérifie OPENROUTER_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY."
+            exit 1
+          fi
+
+      - name: Deploy backend on Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          service: ${{ env.BACKEND_SERVICE_NAME }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ needs.build-and-push.outputs.backend_image }}
+          port: 8000
+          env_vars: |-
+            OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+            SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+            QDRANT_URL=${{ needs.deploy-qdrant.outputs.qdrant_url }}
+            ALLOWED_ORIGINS=${{ vars.ALLOWED_ORIGINS }}
+            LLM_PROVIDER=openrouter
+          env_vars_update_strategy: merge
+
+      - name: Santé backend /health
+        run: |
+          URL=$(gcloud run services describe "${BACKEND_SERVICE_NAME}" \
+            --region "${GCP_REGION}" --format 'value(status.url)')
+          echo "URL Cloud Run backend: $URL"
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "${URL}/health"
+
+  deploy-frontend:
+    name: Deploy frontend to Cloud Run
+    needs: [build-and-push, deploy-backend]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Deploy frontend on Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          service: ${{ env.FRONTEND_SERVICE_NAME }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ needs.build-and-push.outputs.frontend_image }}
+          port: 80
+
+      - name: Afficher URL frontend
+        run: |
+          URL=$(gcloud run services describe "${FRONTEND_SERVICE_NAME}" \
+            --region "${GCP_REGION}" --format 'value(status.url)')
+          echo "URL Cloud Run frontend: $URL"

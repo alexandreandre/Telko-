@@ -1,0 +1,28 @@
+# Dépendances Python du backend Telko.
+# Installer avec : pip install -r requirements.txt
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv>=1.0
+openpyxl>=3.1
+
+# Parsers de fichiers (ingestion)
+pymupdf>=1.24
+python-docx>=1.1
+python-pptx>=0.6
+pytesseract>=0.3
+Pillow>=10.0
+
+# LangChain & vecteur
+langchain-core>=0.2
+langchain-text-splitters>=0.2
+langchain-qdrant>=0.1
+langchain-ollama>=0.1
+qdrant-client>=1.8
+
+# Intégrations cloud (Azure / Graph)
+azure-identity>=1.17
+azure-core>=1.30
