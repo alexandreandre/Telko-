@@ -205,20 +205,32 @@ class QdrantStore:
 
     def __init__(self) -> None:
         self._collection = settings.qdrant_collection_name
-        # Instance Qdrant externe (URL + API key) pour dev et prod full cloud.
-        self._client = QdrantClient(
-            url=settings.qdrant_url,
-            api_key=settings.qdrant_api_key or None,
-        )
-        # Embeddings full cloud via OpenRouter (API /embeddings).
-        self._embeddings = OpenRouterEmbeddings()
-        # Lazy : initialisé après init_collection()
-        self._lc_store: QdrantVectorStore | None = None
         logger.info(
-            "QdrantStore initialisé — collection=%s url=%s",
+            "QdrantStore.__init__ — collection=%s, url=%s, api_key_defined=%s",
             self._collection,
             settings.qdrant_url,
+            bool(settings.qdrant_api_key),
         )
+
+        # Instance Qdrant externe (URL + API key) pour dev et prod full cloud.
+        try:
+            self._client = QdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key or None,
+            )
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            logger.exception("Échec de la création du client QdrantClient : %s", exc)
+            raise
+
+        # Embeddings full cloud via OpenRouter (API /embeddings).
+        try:
+            self._embeddings = OpenRouterEmbeddings()
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            logger.exception("Échec de l'initialisation d'OpenRouterEmbeddings : %s", exc)
+            raise
+
+        # Lazy : initialisé après init_collection()
+        self._lc_store: QdrantVectorStore | None = None
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -230,6 +242,10 @@ class QdrantStore:
         Doit être appelée une fois au démarrage de l'application.
         Distance : cosine. Taille des vecteurs : 768.
         """
+        logger.info(
+            "QdrantStore.init_collection — tentative d'initialisation de la collection '%s'.",
+            self._collection,
+        )
         existing = {c.name for c in self._client.get_collections().collections}
         if self._collection not in existing:
             self._client.create_collection(
