@@ -9,7 +9,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # --- API (remplacement des Edge Functions Supabase) -------------------------
-    openai_api_key: str
+    # Clé OpenAI héritée de l’ancienne archi, non utilisée dans la nouvelle config.
+    # On la rend optionnelle pour ne pas bloquer le chargement des settings.
+    openai_api_key: str = ""
     supabase_url: str
     supabase_service_role_key: str
     supabase_anon_key: str
