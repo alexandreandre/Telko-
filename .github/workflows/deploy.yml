@@ -111,7 +111,7 @@ jobs:
           service: ${{ env.QDRANT_SERVICE_NAME }}
           region: ${{ env.GCP_REGION }}
           image: qdrant/qdrant:latest
-          port: 6333
+          flags: --port=6333
 
       - id: get-url
         name: Récupérer l'URL Cloud Run de Qdrant
