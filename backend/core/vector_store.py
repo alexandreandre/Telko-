@@ -239,29 +239,42 @@ class QdrantStore:
     def init_collection(self) -> None:
         """
         Crée la collection Qdrant si elle n'existe pas encore.
-        Doit être appelée une fois au démarrage de l'application.
-        Distance : cosine. Taille des vecteurs : 768.
+        Peut être appelée au démarrage OU à la volée (lazy init).
+        Distance : cosine. Taille des vecteurs : _VECTOR_SIZE.
         """
+        if self._lc_store is not None:
+            # Déjà initialisé (ex: appel précédent depuis startup ou lazy init)
+            return
+
         logger.info(
             "QdrantStore.init_collection — tentative d'initialisation de la collection '%s'.",
             self._collection,
         )
-        existing = {c.name for c in self._client.get_collections().collections}
-        if self._collection not in existing:
-            self._client.create_collection(
-                collection_name=self._collection,
-                vectors_config=VectorParams(size=_VECTOR_SIZE, distance=Distance.COSINE),
-            )
-            logger.info("Collection '%s' créée (dim=%d, cosine).", self._collection, _VECTOR_SIZE)
-        else:
-            logger.info("Collection '%s' déjà existante.", self._collection)
+        try:
+            existing = {c.name for c in self._client.get_collections().collections}
+            if self._collection not in existing:
+                self._client.create_collection(
+                    collection_name=self._collection,
+                    vectors_config=VectorParams(size=_VECTOR_SIZE, distance=Distance.COSINE),
+                )
+                logger.info(
+                    "Collection '%s' créée (dim=%d, cosine).",
+                    self._collection,
+                    _VECTOR_SIZE,
+                )
+            else:
+                logger.info("Collection '%s' déjà existante.", self._collection)
 
-        # Initialise le store LangChain maintenant que la collection existe
-        self._lc_store = QdrantVectorStore(
-            client=self._client,
-            collection_name=self._collection,
-            embedding=self._embeddings,
-        )
+            # Initialise le store LangChain maintenant que la collection existe
+            self._lc_store = QdrantVectorStore(
+                client=self._client,
+                collection_name=self._collection,
+                embedding=self._embeddings,
+            )
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            logger.exception("Échec de l'initialisation de la collection Qdrant : %s", exc)
+            # On laisse _lc_store à None pour que les appels suivants puissent retenter
+            raise
 
     def _require_store(self) -> QdrantVectorStore:
         """Lève une erreur explicite si init_collection() n'a pas été appelé."""
@@ -292,6 +305,12 @@ class QdrantStore:
         """
         if not docs:
             raise ValueError("La liste de documents ne peut pas être vide.")
+
+        # Lazy init : si Qdrant n'a pas été prêt au startup, on retente ici
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            raise RuntimeError(f"Erreur Qdrant (init_collection dans add_documents) : {exc}") from exc
 
         store = self._require_store()
         logger.info("Upsert de %d document(s) dans '%s'.", len(docs), self._collection)
@@ -327,6 +346,12 @@ class QdrantStore:
         Raises:
             RuntimeError: Si la recherche échoue.
         """
+        # Lazy init : si Qdrant n'a pas été prêt au startup, on retente ici
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            raise RuntimeError(f"Erreur Qdrant (init_collection dans similarity_search) : {exc}") from exc
+
         store = self._require_store()
         logger.debug(
             "QdrantStore.similarity_search → début (len(query)=%d, k=%d, collection=%s)",
@@ -373,6 +398,11 @@ class QdrantStore:
             RuntimeError: Si la suppression échoue.
         """
         logger.info("Suppression des points avec source='%s'.", source_id)
+        # Lazy init : si Qdrant n'a pas été prêt au startup, on retente ici
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover - dépend de l'infra externe
+            raise RuntimeError(f"Erreur Qdrant (init_collection dans delete_document) : {exc}") from exc
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
