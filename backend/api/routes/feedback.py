@@ -11,7 +11,8 @@ class FeedbackBody(BaseModel):
     model: str
     prompt: str
     response: str
-    rating: int = Field(..., ge=1, le=10)
+    # 1 = pouce bas, 2 = pouce haut
+    rating: int = Field(..., ge=1, le=2)
     response_time_ms: int | None = None
     cost_estimate_usd: float | None = None
     conversation_id: str | None = None

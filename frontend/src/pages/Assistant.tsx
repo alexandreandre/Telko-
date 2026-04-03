@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
+import { Link } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import AppLayout from "@/components/AppLayout";
@@ -29,6 +29,8 @@ import {
   FileText,
   Check,
   ChevronsUpDown,
+  ThumbsDown,
+  ThumbsUp,
 } from "lucide-react";
 
 import { useToast } from "@/hooks/use-toast";
@@ -38,6 +40,8 @@ import DocumentMention, { type Doc } from "@/components/assistant/DocumentMentio
 import MentionedDocBadge from "@/components/assistant/MentionedDocBadge";
 import { extractPdfText, isPdfPlaceholderContent } from "@/lib/pdf-text";
 import { getApiBaseUrl } from "@/lib/api";
+import { fetchAssistantGameQuestions, type AssistantGameQuestion } from "@/lib/assistantGameQuestions";
+import { partitionModelsForAssistant } from "@/lib/relevantModels";
 
 interface Msg {
   role: "user" | "assistant";
@@ -78,30 +82,67 @@ interface Conversation {
   updated_at: string;
 }
 
+type LicenseKind = "proprietary" | "open_weights" | "unknown";
+
 interface OpenRouterModel {
   id: string;
   name: string;
   description?: string;
   context_length: number;
+  license_kind?: LicenseKind;
+  pricing_per_1m_usd?: {
+    input?: number | null;
+    output?: number | null;
+  };
   pricing?: {
     prompt?: string;
     completion?: string;
   };
 }
 
+function formatPricingPer1mUsd(
+  input: number | null | undefined,
+  output: number | null | undefined,
+): string | null {
+  if (input == null && output == null) return null;
+  const fmt = (n: number) =>
+    n.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  const inPart = input != null ? `${fmt(input)} $` : "—";
+  const outPart = output != null ? `${fmt(output)} $` : "—";
+  return `Entrée ${inPart} · Sortie ${outPart} / 1M tokens`;
+}
+
 const getChatUrl = () => `${getApiBaseUrl()}/chat`;
 
-const SUGGESTED_PROMPTS = [
-  { icon: "📋", text: "Quelle est la procédure d'installation fibre optique ?" },
-  { icon: "💰", text: "Quels sont nos tarifs entreprises 2025 ?" },
-  { icon: "🔧", text: "Comment dépanner un problème réseau courant ?" },
-  { icon: "🔒", text: "Résume notre politique de sécurité informatique" },
-  { icon: "👋", text: "Quel est le process d'onboarding d'un nouvel employé ?" },
-];
+/** Dernier modèle OpenRouter choisi ou ayant servi à une réponse réussie (préféré au default API). */
+const LAST_OPENROUTER_MODEL_KEY = "telko_last_openrouter_model";
+
+function readPersistedOpenRouterModel(): string | null {
+  try {
+    return window.localStorage.getItem(LAST_OPENROUTER_MODEL_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistOpenRouterModel(modelId: string) {
+  try {
+    window.localStorage.setItem(LAST_OPENROUTER_MODEL_KEY, modelId);
+  } catch {
+    /* quota / navigation privée */
+  }
+}
+
+function resolveOpenRouterModelSelection(models: OpenRouterModel[], apiDefault?: string): string {
+  const ids = new Set(models.map((m) => m.id));
+  const saved = readPersistedOpenRouterModel();
+  if (saved && (ids.has(saved) || saved === "openrouter/auto")) return saved;
+  if (apiDefault) return apiDefault;
+  return "openrouter/auto";
+}
 
 export default function Assistant() {
   const { user, profile, role } = useAuth();
-  const navigate = useNavigate();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("openrouter/auto");
@@ -114,7 +155,8 @@ export default function Assistant() {
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionedDocs, setMentionedDocs] = useState<Doc[]>([]);
   const [docCount, setDocCount] = useState(0);
-  const [ratings, setRatings] = useState<Record<number, number>>({});
+  /** 1 = pouce bas, 2 = pouce haut (aligné sur l’API). */
+  const [ratings, setRatings] = useState<Record<number, 1 | 2>>({});
   const [ratingsSent, setRatingsSent] = useState<Record<number, boolean>>({});
   const [responseTimeMs, setResponseTimeMs] = useState<number>(0);
   const [sendTime, setSendTime] = useState<number>(0);
@@ -122,18 +164,66 @@ export default function Assistant() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const [gameQuestions, setGameQuestions] = useState<AssistantGameQuestion[]>([]);
+
+  const applyGameQuestion = useCallback((text: string) => {
+    setInput(text);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }, []);
+
+  const modelSelectorSections = useMemo(() => {
+    const { relevantProprietary, relevantOpenWeights, restByLicense } =
+      partitionModelsForAssistant(availableModels);
+    const otherNonOpenSource = [...restByLicense.proprietary, ...restByLicense.unknown];
+
+    type Sub = { key: string; subHeading: string; items: OpenRouterModel[] };
+    type Block = { key: string; mainHeading: string; subsections: Sub[] };
+
+    const blocks: Block[] = [];
+
+    const relevantSubsections: Sub[] = [
+      { key: "non-open", subHeading: "Non open-source", items: relevantProprietary },
+      { key: "open", subHeading: "Open-source", items: relevantOpenWeights },
+    ].filter((s) => s.items.length > 0);
+
+    if (relevantSubsections.length > 0) {
+      blocks.push({
+        key: "relevant-rag",
+        mainHeading: "Modèles pertinents pour notre usage (RAG interne)",
+        subsections: relevantSubsections,
+      });
+    }
+
+    const otherSubsections: Sub[] = [
+      { key: "non-open", subHeading: "Non open-source", items: otherNonOpenSource },
+      { key: "open", subHeading: "Open-source", items: restByLicense.openWeights },
+    ].filter((s) => s.items.length > 0);
+
+    if (otherSubsections.length > 0) {
+      blocks.push({
+        key: "other",
+        mainHeading: "Autres modèles",
+        subsections: otherSubsections,
+      });
+    }
+
+    return blocks;
+  }, [availableModels]);
+
+  useEffect(() => {
+    fetchAssistantGameQuestions()
+      .then(setGameQuestions)
+      .catch(() => setGameQuestions([]));
+  }, []);
 
   // Fetch des modèles OpenRouter disponibles au montage
   useEffect(() => {
     fetch(`${getApiBaseUrl()}/api/llm/openrouter/models`)
       .then((r) => r.json())
       .then((data: { default_model?: string; models?: OpenRouterModel[] }) => {
-        if (Array.isArray(data.models)) {
-          setAvailableModels(data.models);
-        }
-        if (data.default_model) {
-          setSelectedModel(data.default_model);
-        }
+        const list = Array.isArray(data.models) ? data.models : [];
+        if (list.length) setAvailableModels(list);
+        setSelectedModel(resolveOpenRouterModelSelection(list, data.default_model));
       })
       .catch(() => {
         // En cas d'erreur on garde le modèle par défaut "openrouter/auto"
@@ -206,8 +296,8 @@ export default function Assistant() {
   useEffect(() => {
     if (!activeConvId) return;
     const metasRaw = window.localStorage.getItem(`telko_message_metas_${activeConvId}`);
-    const ratingsRaw = window.localStorage.getItem(`telko_ratings_${activeConvId}`);
-    const ratingsSentRaw = window.localStorage.getItem(`telko_ratings_sent_${activeConvId}`);
+    const ratingsRaw = window.localStorage.getItem(`telko_thumbs_${activeConvId}`);
+    const ratingsSentRaw = window.localStorage.getItem(`telko_thumbs_sent_${activeConvId}`);
     if (metasRaw) {
       try {
         setMessageMetas(JSON.parse(metasRaw));
@@ -219,7 +309,14 @@ export default function Assistant() {
     }
     if (ratingsRaw) {
       try {
-        setRatings(JSON.parse(ratingsRaw));
+        const parsed = JSON.parse(ratingsRaw) as Record<string, number>;
+        const next: Record<number, 1 | 2> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          const idx = Number(k);
+          if (!Number.isFinite(idx)) continue;
+          if (v === 1 || v === 2) next[idx] = v;
+        }
+        setRatings(next);
       } catch {
         setRatings({});
       }
@@ -247,13 +344,13 @@ export default function Assistant() {
 
   useEffect(() => {
     if (!activeConvId) return;
-    window.localStorage.setItem(`telko_ratings_${activeConvId}`, JSON.stringify(ratings));
+    window.localStorage.setItem(`telko_thumbs_${activeConvId}`, JSON.stringify(ratings));
   }, [activeConvId, ratings]);
 
   useEffect(() => {
     if (!activeConvId) return;
     window.localStorage.setItem(
-      `telko_ratings_sent_${activeConvId}`,
+      `telko_thumbs_sent_${activeConvId}`,
       JSON.stringify(ratingsSent),
     );
   }, [activeConvId, ratingsSent]);
@@ -267,6 +364,8 @@ export default function Assistant() {
   const startNewConversation = () => {
     if (activeConvId) {
       window.localStorage.removeItem(`telko_message_metas_${activeConvId}`);
+      window.localStorage.removeItem(`telko_thumbs_${activeConvId}`);
+      window.localStorage.removeItem(`telko_thumbs_sent_${activeConvId}`);
       window.localStorage.removeItem(`telko_ratings_${activeConvId}`);
       window.localStorage.removeItem(`telko_ratings_sent_${activeConvId}`);
     }
@@ -284,6 +383,8 @@ export default function Assistant() {
     await supabase.from("conversations").delete().eq("id", convId);
     if (activeConvId === convId) {
       window.localStorage.removeItem(`telko_message_metas_${convId}`);
+      window.localStorage.removeItem(`telko_thumbs_${convId}`);
+      window.localStorage.removeItem(`telko_thumbs_sent_${convId}`);
       window.localStorage.removeItem(`telko_ratings_${convId}`);
       window.localStorage.removeItem(`telko_ratings_sent_${convId}`);
       setActiveConvId(null);
@@ -430,6 +531,7 @@ export default function Assistant() {
     }
 
     setSendTime(Date.now());
+    const modelUsedForRequest = selectedModel;
 
     try {
       const resp = await fetch(getChatUrl(), {
@@ -523,6 +625,7 @@ export default function Assistant() {
       if (assistantSoFar && convId) {
         await saveMessage(convId, { role: "assistant", content: assistantSoFar });
       }
+      persistOpenRouterModel(modelUsedForRequest);
     } catch (e) {
       console.error(e);
       toast({ title: "Erreur", description: "Impossible de contacter l'assistant.", variant: "destructive" });
@@ -532,7 +635,7 @@ export default function Assistant() {
     loadConversations();
   };
 
-  const handleRating = async (messageIndex: number, rating: number, response: string) => {
+  const handleRating = async (messageIndex: number, rating: 1 | 2, response: string) => {
     setRatings((prev) => ({ ...prev, [messageIndex]: rating }));
 
     const userMessage = messages[messageIndex - 1]?.content ?? "";
@@ -565,8 +668,14 @@ export default function Assistant() {
     }
   };
 
-  const selectedModelLabel =
-    availableModels.find((m) => m.id === selectedModel)?.name ?? selectedModel ?? "Choisir un modèle";
+  const selectedModelEntry = availableModels.find((m) => m.id === selectedModel);
+  const selectedModelLabel = selectedModelEntry?.name ?? selectedModel ?? "Choisir un modèle";
+  const selectedModelPricingLine = selectedModelEntry
+    ? formatPricingPer1mUsd(
+        selectedModelEntry.pricing_per_1m_usd?.input ?? undefined,
+        selectedModelEntry.pricing_per_1m_usd?.output ?? undefined,
+      )
+    : null;
 
   const formatModelLabel = (modelIdOrName: string | undefined) => {
     if (!modelIdOrName) return "Modèle OpenRouter";
@@ -654,18 +763,32 @@ export default function Assistant() {
                       Je connais l'intégralité de votre base documentaire. Posez-moi une question ou utilisez <kbd className="px-1.5 py-0.5 bg-muted rounded text-xs font-mono">@</kbd> pour cibler un document précis.
                     </p>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-lg">
-                    {SUGGESTED_PROMPTS.map((prompt, i) => (
-                      <button
-                        key={i}
-                        onClick={() => handleSend(prompt.text)}
-                        className="text-left p-3 rounded-lg border border-border hover:bg-muted/50 hover:border-primary/30 transition-colors text-sm"
+                  {gameQuestions.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full max-w-lg">
+                      {gameQuestions.map((prompt, i) => (
+                        <button
+                          key={`${i}-${prompt.text.slice(0, 24)}`}
+                          type="button"
+                          onClick={() => applyGameQuestion(prompt.text)}
+                          className="text-left p-3 rounded-lg border border-border hover:bg-muted/50 hover:border-primary/30 transition-colors text-sm"
+                        >
+                          <span className="mr-2">{prompt.icon}</span>
+                          <span className="text-muted-foreground">{prompt.text}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground text-center max-w-md">
+                      Aucune suggestion pour le moment. Ajoutez-en depuis la page{" "}
+                      <Link
+                        to="/jeu-questions"
+                        className="text-primary underline underline-offset-2 hover:text-primary/80 font-medium"
                       >
-                        <span className="mr-2">{prompt.icon}</span>
-                        <span className="text-muted-foreground">{prompt.text}</span>
-                      </button>
-                    ))}
-                  </div>
+                        Jeu de questions
+                      </Link>
+                      .
+                    </p>
+                  )}
                 </div>
               )}
               {messages.map((msg, i) => (
@@ -727,6 +850,10 @@ export default function Assistant() {
                           u?.embeddings?.total_tokens != null
                             ? u.embeddings.total_tokens
                             : undefined;
+                        const tokensCombined =
+                          llmTokensTotal != null || embedTokensTotal != null
+                            ? (llmTokensTotal ?? 0) + (embedTokensTotal ?? 0)
+                            : null;
                         const totalCostUsd =
                           u?.cost?.total_usd != null
                             ? u.cost.total_usd
@@ -759,18 +886,10 @@ export default function Assistant() {
                                 </div>
                               </div>
                               <div>
-                                <div className="text-muted-foreground/80">Tokens LLM</div>
+                                <div className="text-muted-foreground/80">Tokens</div>
                                 <div className="font-mono">
-                                  {llmTokensTotal != null
-                                    ? llmTokensTotal.toLocaleString("fr-FR")
-                                    : "—"}
-                                </div>
-                              </div>
-                              <div>
-                                <div className="text-muted-foreground/80">Tokens embeddings</div>
-                                <div className="font-mono">
-                                  {embedTokensTotal != null
-                                    ? embedTokensTotal.toLocaleString("fr-FR")
+                                  {tokensCombined != null
+                                    ? tokensCombined.toLocaleString("fr-FR")
                                     : "—"}
                                 </div>
                               </div>
@@ -787,31 +906,85 @@ export default function Assistant() {
                         );
                       })()}
                       {messageMetas[i] && (
-                        <div className="inline-flex items-center gap-2 px-2 py-0.5 rounded-full bg-primary/5 border border-primary/40 text-[11px]">
-                        {ratingsSent[i] ? (
-                          <span className="text-[11px] text-green-600">Merci pour votre retour ✓</span>
-                        ) : (
-                          <>
-                            <span className="font-medium text-foreground/90">Votre avis sur cette réponse :</span>
-                            <div className="flex items-center gap-0.5">
-                              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((star) => (
-                                <button
-                                  key={star}
-                                  onClick={() => handleRating(i, star, msg.content)}
-                                  className={`text-sm leading-none px-0.5 transition-colors ${
-                                    (ratings[i] ?? 0) >= star
-                                      ? "text-yellow-400"
-                                      : "text-gray-300 hover:text-yellow-300"
-                                  }`}
-                                  aria-label={`Note ${star} sur 10`}
-                                >
-                                  ★
-                                </button>
-                              ))}
+                        <div className="mt-1 max-w-[min(100%,420px)] rounded-lg border border-emerald-400/35 bg-gradient-to-r from-emerald-500/[0.14] via-sky-400/[0.1] to-rose-500/[0.14] px-2.5 py-2 shadow-sm ring-1 ring-inset ring-white/40 dark:border-emerald-500/25 dark:from-emerald-500/20 dark:via-sky-500/15 dark:to-rose-500/20 dark:ring-white/10">
+                          {ratingsSent[i] ? (
+                            <div
+                              className={cn(
+                                "flex items-center gap-2.5 text-xs font-medium leading-snug",
+                                ratings[i] === 2
+                                  ? "text-emerald-800 dark:text-emerald-300"
+                                  : "text-rose-800 dark:text-rose-300",
+                              )}
+                            >
+                              {ratings[i] === 2 ? (
+                                <ThumbsUp
+                                  className="h-8 w-8 shrink-0 fill-emerald-500 stroke-emerald-800 drop-shadow-sm dark:fill-emerald-400 dark:stroke-emerald-100"
+                                  strokeWidth={1.5}
+                                />
+                              ) : (
+                                <ThumbsDown
+                                  className="h-8 w-8 shrink-0 fill-rose-500 stroke-rose-900 drop-shadow-sm dark:fill-rose-400 dark:stroke-rose-100"
+                                  strokeWidth={1.5}
+                                />
+                              )}
+                              <span>Merci pour votre retour</span>
                             </div>
-                          </>
-                        )}
-                      </div>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                              <p className="text-xs font-medium leading-snug text-sky-900 dark:text-sky-200">
+                                Cette réponse vous a-t-elle aidé ?
+                              </p>
+                              <div
+                                className="flex items-center gap-4"
+                                role="group"
+                                aria-label="Évaluation de la réponse"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => handleRating(i, 2, msg.content)}
+                                  className={cn(
+                                    "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
+                                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                                    "active:scale-90",
+                                  )}
+                                  aria-label="Pouce haut — utile"
+                                  aria-pressed={ratings[i] === 2}
+                                >
+                                  <ThumbsUp
+                                    className={cn(
+                                      "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
+                                      ratings[i] === 2
+                                        ? "fill-emerald-500 stroke-emerald-800 dark:fill-emerald-400 dark:stroke-emerald-100"
+                                        : "fill-none stroke-emerald-600 hover:stroke-emerald-700 hover:drop-shadow-md dark:stroke-emerald-400/90 dark:hover:stroke-emerald-300",
+                                    )}
+                                    strokeWidth={ratings[i] === 2 ? 1.5 : 2.25}
+                                  />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRating(i, 1, msg.content)}
+                                  className={cn(
+                                    "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
+                                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                                    "active:scale-90",
+                                  )}
+                                  aria-label="Pouce bas — pas utile"
+                                  aria-pressed={ratings[i] === 1}
+                                >
+                                  <ThumbsDown
+                                    className={cn(
+                                      "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
+                                      ratings[i] === 1
+                                        ? "fill-rose-500 stroke-rose-900 dark:fill-rose-400 dark:stroke-rose-100"
+                                        : "fill-none stroke-rose-600 hover:stroke-rose-700 hover:drop-shadow-md dark:stroke-rose-400/90 dark:hover:stroke-rose-300",
+                                    )}
+                                    strokeWidth={ratings[i] === 1 ? 1.5 : 2.25}
+                                  />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}
@@ -838,47 +1011,85 @@ export default function Assistant() {
                         variant="outline"
                         role="combobox"
                         aria-expanded={modelPopoverOpen}
-                        className="h-8 max-w-xs justify-between text-xs"
+                        className="h-auto min-h-8 max-w-md justify-between text-xs py-1.5 px-3"
                       >
-                        <span className="truncate mr-2">{selectedModelLabel}</span>
-                        <ChevronsUpDown className="h-3 w-3 opacity-60" />
+                        <div className="flex flex-col items-start gap-0.5 min-w-0 mr-2 text-left">
+                          <span className="truncate w-full">{selectedModelLabel}</span>
+                          {selectedModelPricingLine ? (
+                            <span className="text-[10px] text-muted-foreground font-normal leading-tight truncate w-full">
+                              {selectedModelPricingLine}
+                            </span>
+                          ) : null}
+                        </div>
+                        <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-60" />
                       </Button>
                     </PopoverTrigger>
-                    <PopoverContent className="w-[320px] p-0">
+                    <PopoverContent className="w-[min(100vw-2rem,380px)] p-0" align="start">
                       <Command>
                         <CommandInput placeholder="Rechercher un modèle…" className="h-8 text-xs" />
-                        <CommandList>
+                        <CommandList className="max-h-[min(60vh,320px)]">
                           <CommandEmpty className="text-[11px] text-muted-foreground px-2 py-2">
                             Aucun modèle ne correspond à la recherche.
                           </CommandEmpty>
-                          <CommandGroup>
-                            {availableModels.map((m) => (
-                              <CommandItem
-                                key={m.id}
-                                value={`${m.name ?? m.id} ${m.id}`}
-                                onSelect={() => {
-                                  setSelectedModel(m.id);
-                                  setModelPopoverOpen(false);
-                                }}
-                                className="text-xs"
+                          {modelSelectorSections.map((block, blockIdx) => (
+                            <Fragment key={block.key}>
+                              <div
+                                className={cn(
+                                  "px-2 pb-1 text-sm font-bold text-foreground leading-snug",
+                                  blockIdx > 0 ? "pt-3 border-t border-border mt-1" : "pt-1.5",
+                                )}
                               >
-                                <Check
-                                  className={cn(
-                                    "mr-2 h-3.5 w-3.5",
-                                    selectedModel === m.id ? "opacity-100" : "opacity-0",
-                                  )}
-                                />
-                                <div className="flex flex-col items-start">
-                                  <span className="truncate max-w-[220px]">
-                                    {m.name ?? m.id}
-                                  </span>
-                                  <span className="text-[10px] text-muted-foreground truncate max-w-[220px]">
-                                    {m.id}
-                                  </span>
-                                </div>
-                              </CommandItem>
-                            ))}
-                          </CommandGroup>
+                                {block.mainHeading}
+                              </div>
+                              {block.subsections.map((sub) => (
+                                <CommandGroup
+                                  key={`${block.key}-${sub.key}`}
+                                  heading={sub.subHeading}
+                                  className="[&_[cmdk-group-heading]]:font-normal"
+                                >
+                                  {sub.items.map((m) => {
+                                    const priceLine = formatPricingPer1mUsd(
+                                      m.pricing_per_1m_usd?.input ?? undefined,
+                                      m.pricing_per_1m_usd?.output ?? undefined,
+                                    );
+                                    return (
+                                      <CommandItem
+                                        key={m.id}
+                                        value={`${m.name ?? m.id} ${m.id} ${priceLine ?? ""}`}
+                                        onSelect={() => {
+                                          setSelectedModel(m.id);
+                                          persistOpenRouterModel(m.id);
+                                          setModelPopoverOpen(false);
+                                        }}
+                                        className="text-xs py-2"
+                                      >
+                                        <Check
+                                          className={cn(
+                                            "mr-2 h-3.5 w-3.5 shrink-0",
+                                            selectedModel === m.id ? "opacity-100" : "opacity-0",
+                                          )}
+                                        />
+                                        <div className="flex flex-col items-start gap-0.5 min-w-0 flex-1">
+                                          <span className="truncate w-full font-medium leading-tight">
+                                            {m.name ?? m.id}
+                                          </span>
+                                          {priceLine ? (
+                                            <span className="text-[10px] text-muted-foreground/85 leading-tight">
+                                              {priceLine}
+                                            </span>
+                                          ) : (
+                                            <span className="text-[10px] text-muted-foreground/60 italic">
+                                              Tarif API non communiqué
+                                            </span>
+                                          )}
+                                        </div>
+                                      </CommandItem>
+                                    );
+                                  })}
+                                </CommandGroup>
+                              ))}
+                            </Fragment>
+                          ))}
                         </CommandList>
                       </Command>
                     </PopoverContent>
@@ -891,6 +1102,26 @@ export default function Assistant() {
                   {mentionedDocs.map((doc) => (
                     <MentionedDocBadge key={doc.id} title={doc.title} content={doc.content} onRemove={() => removeMentionedDoc(doc.id)} />
                   ))}
+                </div>
+              )}
+
+              {gameQuestions.length > 0 && messages.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[11px] text-muted-foreground">Idées du jeu de questions</span>
+                  <div className="flex gap-2 overflow-x-auto pb-0.5 -mx-0.5 px-0.5 [scrollbar-width:thin]">
+                    {gameQuestions.map((q, i) => (
+                      <button
+                        key={`chip-${i}-${q.text.slice(0, 16)}`}
+                        type="button"
+                        onClick={() => applyGameQuestion(q.text)}
+                        className="flex items-center gap-1.5 shrink-0 max-w-[min(100%,300px)] text-left rounded-full border border-border bg-muted/40 hover:bg-muted/70 px-3 py-1.5 text-xs text-foreground transition-colors"
+                        title={q.text}
+                      >
+                        <span className="shrink-0">{q.icon}</span>
+                        <span className="truncate min-w-0">{q.text}</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
 

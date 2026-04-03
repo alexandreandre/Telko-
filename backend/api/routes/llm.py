@@ -97,8 +97,16 @@ def _classify_open_weights(model_id: str | None) -> str:
         "mistral/mistral-nemo",
         "mistral/open-mistral",
         "mistral/smollm",
+        # mistralai/mistral-small-3.x : offres API Mistral (non open-weight) — classées via le préfixe mistralai/ (closed)
         "mistral/mixtral-8x7b",
         "mistral/codestral",
+        # Même famille open-weight sous le vendor « mistralai/ » (7B, Nemo, Ministral…)
+        # — doit précéder la règle fermée « mistralai/ » ci-dessous (open testé en premier).
+        "mistralai/mistral-7b",
+        "mistralai/mistral-nemo",
+        "mistralai/open-mistral-7b",
+        "mistralai/ministral-3b",
+        "mistralai/ministral-8b",
         # Qwen open weights
         "qwen/qwen",
         "qwen2",
@@ -157,7 +165,7 @@ def _classify_open_weights(model_id: str | None) -> str:
         "writer/",
         "xiaomi/",
         "z-ai/",
-        # Mistral API-only familles
+        # Mistral API-only (hors préfixes open-weight mistralai/… listés plus haut)
         "mistralai/",
         # Divers vendors / routers supplémentaires
         "aion-labs/",
@@ -284,6 +292,62 @@ def _normalize_pricing(raw: dict | None) -> dict:
     }
 
 
+# Ordre d'affichage prioritaire dans le sélecteur (pertinence RAG + français / doc interne).
+# Préfixes d'ID OpenRouter ; les plus spécifiques doivent précéder les plus génériques.
+_CURATED_MODEL_ORDER: list[str] = [
+    "openai/gpt-4o-mini",
+    "openai/gpt-4o-mini-search-preview",
+    "google/gemini-3.1-flash-lite-preview",
+    "google/gemini-3.1-flash-lite",
+    "google/gemini-2.5-flash-lite",
+    "mistralai/mistral-small-3.2-24b-instruct",
+    "mistralai/mistral-small-3.2-24b",
+    "mistralai/mistral-small-3.2",
+    "meta-llama/llama-3.1-8b",
+    "mistral/mistral-nemo",
+    "mistral/mistral-7b",
+    "mistral/open-mistral-7b",
+    "mistralai/mistral-nemo",
+    "mistralai/mistral-7b",
+    "mistralai/open-mistral-7b",
+    "qwen/qwen-2.5-7b",
+    "qwen/qwen-2.5-14b",
+    "qwen/qwen2.5-14b",
+    "qwen/qwen2.5-7b",
+    "google/gemma-2-27b",
+    "google/gemma-2-9b",
+]
+
+
+def _curated_model_rank(model_id: str | None) -> int:
+    if not model_id:
+        return 10_000
+    mid = model_id.lower()
+    for i, prefix in enumerate(_CURATED_MODEL_ORDER):
+        if mid.startswith(prefix.lower()):
+            return i
+    return 10_000
+
+
+def _license_kind_for_ui(model_id: str | None) -> str:
+    """open_weights | proprietary | unknown — aligné sur les libellés du sélecteur."""
+    c = _classify_open_weights(model_id)
+    if c == "open":
+        return "open_weights"
+    if c == "closed":
+        return "proprietary"
+    return "unknown"
+
+
+def _openrouter_model_sort_key(entry: dict) -> tuple:
+    """API propriétaire d'abord, puis poids ouverts, puis autres ; modèles « curated » en tête de chaque bloc."""
+    lk = entry.get("license_kind") or "unknown"
+    grp = 0 if lk == "proprietary" else 1 if lk == "open_weights" else 2
+    mid = entry.get("id") or ""
+    name = (entry.get("name") or mid).lower()
+    return (grp, _curated_model_rank(mid), name)
+
+
 def _is_free_or_router_model(m: dict) -> bool:
     """
     Filtre les modèles que l'on ne souhaite pas exposer au client :
@@ -351,16 +415,25 @@ async def get_openrouter_models():
 
     models: list[dict] = []
     for m in raw_models:
-        # On expose un sous-ensemble des champs via l'API publique
+        mid = m.get("id")
+        norm = _normalize_pricing(m.get("pricing"))
+        lk = _license_kind_for_ui(mid)
         models.append(
             {
-                "id": m.get("id"),
-                "name": m.get("name") or m.get("id"),
+                "id": mid,
+                "name": m.get("name") or mid,
                 "description": m.get("description") or "",
                 "context_length": m.get("context_length", 0),
                 "pricing": m.get("pricing", {}),
+                "license_kind": lk,
+                "pricing_per_1m_usd": {
+                    "input": norm["input_per_1m_usd"],
+                    "output": norm["output_per_1m_usd"],
+                },
             }
         )
+
+    models.sort(key=_openrouter_model_sort_key)
 
     return {
         "default_model": settings.openrouter_llm_model,

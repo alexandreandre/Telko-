@@ -5,6 +5,10 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent.parent / "data" / "feedback.db"
 
 
+# Après migration : rating 1 = pouce bas, 2 = pouce haut (échelle historique 1–10 convertie une fois).
+_FEEDBACK_DB_VERSION = 3
+
+
 class FeedbackStore:
     """
     Stocke les feedbacks utilisateur dans SQLite.
@@ -15,7 +19,7 @@ class FeedbackStore:
       model             TEXT
       prompt            TEXT
       response          TEXT
-      rating            INTEGER (1-10)
+      rating            INTEGER (1 = pouce bas, 2 = pouce haut)
       response_time_ms  INTEGER
       cost_estimate_usd REAL (nullable)
       conversation_id   TEXT
@@ -44,6 +48,15 @@ class FeedbackStore:
                     user_id TEXT
                 )
             """)
+            cur = conn.execute("PRAGMA user_version")
+            ver = int(cur.fetchone()[0] or 0)
+            if ver < _FEEDBACK_DB_VERSION:
+                # Ancienne échelle 1–10 : >= 7 → pouce haut, sinon pouce bas.
+                conn.execute("""
+                    UPDATE feedbacks
+                    SET rating = CASE WHEN rating >= 7 THEN 2 ELSE 1 END
+                """)
+                conn.execute(f"PRAGMA user_version = {_FEEDBACK_DB_VERSION}")
             conn.commit()
 
     def save(
@@ -89,10 +102,9 @@ class FeedbackStore:
         """
         Retourne les stats agrégées par (provider, model) :
         - count               : nombre de feedbacks
-        - avg_rating          : note moyenne
         - avg_response_time_ms: temps moyen
         - total_cost_usd      : coût total estimé
-        - satisfaction_rate   : % de notes >= 7
+        - satisfaction_rate   : % de pouces haut (rating = 2)
         """
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -101,13 +113,12 @@ class FeedbackStore:
                     provider,
                     model,
                     COUNT(*) as count,
-                    ROUND(AVG(rating), 2) as avg_rating,
                     ROUND(AVG(response_time_ms)) as avg_response_time_ms,
                     ROUND(SUM(COALESCE(cost_estimate_usd, 0)), 6) as total_cost_usd,
-                    ROUND(100.0 * SUM(CASE WHEN rating >= 7 THEN 1 ELSE 0 END) / COUNT(*), 1) as satisfaction_rate
+                    ROUND(100.0 * SUM(CASE WHEN rating = 2 THEN 1 ELSE 0 END) / COUNT(*), 1) as satisfaction_rate
                 FROM feedbacks
                 GROUP BY provider, model
-                ORDER BY avg_rating DESC
+                ORDER BY satisfaction_rate DESC, model ASC
             """).fetchall()
             return [dict(row) for row in rows]
 

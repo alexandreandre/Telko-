@@ -19,6 +19,7 @@ import Rapports from "./pages/Rapports";
 
 import KnowledgeBase from "./pages/KnowledgeBase";
 import LLMComparator from "./pages/LLMComparator";
+import QuestionGame from "./pages/QuestionGame";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -45,6 +46,7 @@ const App = () => (
             
             <Route path="/knowledge-base" element={<ProtectedRoute path="/knowledge-base"><KnowledgeBase /></ProtectedRoute>} />
             <Route path="/llm-comparator" element={<ProtectedRoute path="/llm-comparator"><LLMComparator /></ProtectedRoute>} />
+            <Route path="/jeu-questions" element={<ProtectedRoute path="/jeu-questions"><QuestionGame /></ProtectedRoute>} />
             <Route path="/" element={<Navigate to="/assistant" replace />} />
             <Route path="*" element={<NotFound />} />
           </Routes>

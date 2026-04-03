@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 import httpx
 
 from config import settings
+from core.feedback_store import get_feedback_store
 
 
 logger = logging.getLogger(__name__)
@@ -51,12 +52,23 @@ class LLMRun:
             timing = meta.get("timing") or {}
             usage = meta.get("usage") or {}
             llm_tokens = (usage.get("llm") or {}) if isinstance(usage, dict) else {}
+            embed_tokens = (usage.get("embeddings") or {}) if isinstance(usage, dict) else {}
             cost = (usage.get("cost") or {}) if isinstance(usage, dict) else {}
 
             response_time_ms = int(round(float(timing.get("response_time_ms") or 0)))
             first_token_ms = int(round(float(timing.get("first_token_ms") or response_time_ms)))
             total_tokens_raw = llm_tokens.get("total_tokens")
-            total_tokens = int(total_tokens_raw) if isinstance(total_tokens_raw, (int, float)) else None
+            embed_raw = embed_tokens.get("total_tokens")
+            llm_n = int(total_tokens_raw) if isinstance(total_tokens_raw, (int, float)) else None
+            embed_n = int(embed_raw) if isinstance(embed_raw, (int, float)) else None
+            if llm_n is not None and embed_n is not None:
+                total_tokens = llm_n + embed_n
+            elif llm_n is not None:
+                total_tokens = llm_n
+            elif embed_n is not None:
+                total_tokens = embed_n
+            else:
+                total_tokens = None
 
             total_cost_raw = cost.get("total_usd")
             cost_total_usd = float(total_cost_raw) if isinstance(total_cost_raw, (int, float)) else None
@@ -274,6 +286,57 @@ def _iter_runs() -> Iterable[LLMRun]:
     return _iter_runs_file()
 
 
+def _feedback_stats_by_model_id(raw_stats: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Indexe les stats SQLite par id de modèle OpenRouter (colonne `model` du feedback).
+    Fusionne plusieurs lignes (ex. même modèle, providers distincts) par moyennes pondérées.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for row in raw_stats:
+        mid = str(row.get("model") or "").strip()
+        if not mid:
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0:
+            continue
+        sat = float(row.get("satisfaction_rate") or 0.0)
+        art = row.get("avg_response_time_ms")
+        avg_rt = float(art) if isinstance(art, (int, float)) and not isinstance(art, bool) else None
+        tcost = row.get("total_cost_usd")
+        total_c = float(tcost) if isinstance(tcost, (int, float)) and not isinstance(tcost, bool) else 0.0
+        prov = str(row.get("provider") or "openrouter")
+
+        if mid not in merged:
+            merged[mid] = {
+                "provider": prov,
+                "model": mid,
+                "count": count,
+                "avg_response_time_ms": avg_rt if avg_rt is not None else 0.0,
+                "total_cost_usd": total_c,
+                "satisfaction_rate": sat,
+            }
+            continue
+
+        cur = merged[mid]
+        n0, n1 = int(cur["count"]), count
+        n = n0 + n1
+        cur["satisfaction_rate"] = (float(cur["satisfaction_rate"]) * n0 + sat * n1) / n
+        cur_rt = float(cur.get("avg_response_time_ms") or 0.0)
+        if avg_rt is not None:
+            cur["avg_response_time_ms"] = (cur_rt * n0 + avg_rt * n1) / n
+        cur["total_cost_usd"] = float(cur.get("total_cost_usd") or 0.0) + total_c
+        cur["count"] = n
+
+    for cur in merged.values():
+        cur["satisfaction_rate"] = round(float(cur["satisfaction_rate"]), 1)
+        cur["avg_response_time_ms"] = round(float(cur.get("avg_response_time_ms") or 0.0))
+
+    return merged
+
+
 def build_usage_aggregates(
     model_catalog: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
@@ -283,15 +346,36 @@ def build_usage_aggregates(
     Retourne un tuple :
       - usage_rows : stats par modèle
       - global_stats : agrégats globaux
-      - feedback_stats : actuellement vide (retours explicites non encore branchés)
+      - feedback_stats : satisfaction (% pouces haut) agrégée depuis SQLite (`feedbacks`)
     """
+    try:
+        raw_feedback = get_feedback_store().get_stats()
+    except Exception:  # pragma: no cover — SQLite / disque
+        logger.warning("build_usage_aggregates — lecture feedback SQLite impossible", exc_info=True)
+        raw_feedback = []
+    feedback_by_model = _feedback_stats_by_model_id(raw_feedback)
+    feedback_stats: list[dict[str, Any]] = [
+        {
+            "provider": v["provider"],
+            "model": v["model"],
+            "count": v["count"],
+            "avg_response_time_ms": v["avg_response_time_ms"],
+            "total_cost_usd": v["total_cost_usd"],
+            "satisfaction_rate": v["satisfaction_rate"],
+        }
+        for v in sorted(
+            feedback_by_model.values(),
+            key=lambda x: (-float(x["satisfaction_rate"]), x["model"]),
+        )
+    ]
+
     runs = list(_iter_runs())
     if not runs:
         return [], {
             "total_generation_runs": 0,
             "total_cost_usd_observed": 0.0,
             "distinct_models_used": 0,
-        }, []
+        }, feedback_stats
 
     by_model: dict[str, list[LLMRun]] = defaultdict(list)
     for r in runs:
@@ -322,6 +406,10 @@ def build_usage_aggregates(
 
         total_cost += total_cost_model
 
+        fb_row = feedback_by_model.get(model_id)
+        rated_n = int(fb_row["count"]) if fb_row else 0
+        sat_pct = float(fb_row["satisfaction_rate"]) if fb_row else None
+
         usage_rows.append(
             {
                 "model": model_id,
@@ -332,12 +420,20 @@ def build_usage_aggregates(
                 "total_cost_usd": total_cost_model,
                 "avg_cost_per_run_usd": avg_cost_run,
                 "avg_total_tokens": avg_tokens,
-                # Ces champs seront alimentés lorsque le système de feedback explicite sera branché.
-                "avg_rating_from_runs": None,
-                "rated_run_count": 0,
-                "satisfaction_from_runs_pct": None,
-                # En attendant, pas de feedback structuré renvoyé pour ces lignes.
-                "feedback": None,
+                "rated_run_count": rated_n,
+                "satisfaction_from_runs_pct": sat_pct,
+                "feedback": (
+                    {
+                        "provider": str(fb_row["provider"]),
+                        "model": model_id,
+                        "count": rated_n,
+                        "avg_response_time_ms": int(fb_row["avg_response_time_ms"]),
+                        "total_cost_usd": float(fb_row["total_cost_usd"]),
+                        "satisfaction_rate": sat_pct,
+                    }
+                    if fb_row
+                    else None
+                ),
                 # Enrichissement avec les métadonnées du catalogue, si disponible.
                 "catalog": catalog_index.get(model_id),
                 "local_hardware_hint": (catalog_index.get(model_id) or {}).get("local_hardware_hint"),
@@ -349,10 +445,6 @@ def build_usage_aggregates(
         "total_cost_usd_observed": total_cost,
         "distinct_models_used": len(by_model),
     }
-
-    # Pour l'instant, on ne remonte pas encore les retours explicites (notes / satisfaction),
-    # donc cette liste est vide.
-    feedback_stats: list[dict[str, Any]] = []
 
     return usage_rows, global_stats, feedback_stats
 

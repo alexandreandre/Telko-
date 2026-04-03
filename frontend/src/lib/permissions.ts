@@ -1,4 +1,4 @@
-import { LucideIcon, MessageSquare, Scale, Shield, TicketCheck, Users, Receipt, Activity, BarChart3, Database, UserCog } from "lucide-react";
+import { LucideIcon, MessageSquare, Scale, Shield, TicketCheck, Users, Receipt, Activity, BarChart3, Database, UserCog, ClipboardList } from "lucide-react";
 
 export interface PagePermission {
   path: string;
@@ -20,6 +20,11 @@ export const pages: PagePermission[] = [
     path: "/llm-comparator",
     title: "Comparateur LLM",
     icon: Scale,
+  },
+  {
+    path: "/jeu-questions",
+    title: "Jeu de questions",
+    icon: ClipboardList,
   },
   {
     path: "/tickets",

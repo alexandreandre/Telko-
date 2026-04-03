@@ -2,6 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import { getApiBaseUrl } from "@/lib/api";
+import {
+  RELEVANT_MODEL_GUIDE,
+  findCatalogMatchForRelevantGuide,
+  type RelevantModelGuideRow,
+} from "@/lib/relevantModels";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import {
@@ -60,9 +65,9 @@ interface FeedbackStat {
   provider: string;
   model: string;
   count: number;
-  avg_rating: number;
   avg_response_time_ms: number;
   total_cost_usd: number;
+  /** Pourcentage de pouces haut parmi les retours. */
   satisfaction_rate: number;
 }
 
@@ -75,7 +80,6 @@ interface UsageRow {
   total_cost_usd: number;
   avg_cost_per_run_usd: number | null;
   avg_total_tokens: number | null;
-  avg_rating_from_runs: number | null;
   rated_run_count: number;
   satisfaction_from_runs_pct: number | null;
   catalog: CatalogModel | null;
@@ -115,15 +119,13 @@ type UsageSortKey =
   | "total_cost_usd"
   | "avg_cost_per_run_usd"
   | "avg_total_tokens"
-  | "note"
   | "satisfaction"
-  | "score"
   | "local_vram";
 
 type UsageSortState = { key: UsageSortKey; dir: "asc" | "desc" };
 
-/** Comportement initial : même ordre qu’avant (score décroissant). */
-const USAGE_SORT_DEFAULT: UsageSortState = { key: "score", dir: "desc" };
+/** Tri initial : activité (runs) décroissante. */
+const USAGE_SORT_DEFAULT: UsageSortState = { key: "run_count", dir: "desc" };
 
 function defaultCatalogSortDir(key: CatalogSortKey): "asc" | "desc" {
   if (key === "input" || key === "output") return "asc";
@@ -142,9 +144,7 @@ function defaultUsageSortDir(key: UsageSortKey): "asc" | "desc" {
       return "asc";
     case "run_count":
     case "avg_total_tokens":
-    case "note":
     case "satisfaction":
-    case "score":
       return "desc";
     case "avg_response_time_ms":
     case "avg_first_token_ms":
@@ -207,6 +207,80 @@ function fmtUsd(n: number | null | undefined, digits = 6) {
 function fmtNum(n: number | null | undefined) {
   if (n == null || Number.isNaN(n)) return "—";
   return Math.round(n).toLocaleString("fr-FR");
+}
+
+function fmtUsdLocaleShort(n: number | null | undefined) {
+  if (n == null || Number.isNaN(n)) return null;
+  return n.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+
+function readCatalogPricingUsdPer1m(m: CatalogModel | undefined): {
+  input: number | null;
+  output: number | null;
+} {
+  if (!m?.pricing) return { input: null, output: null };
+  const inp = m.pricing.input_per_1m_usd ?? m.pricing.prompt_per_1m_usd ?? null;
+  const out = m.pricing.output_per_1m_usd ?? m.pricing.completion_per_1m_usd ?? null;
+  return { input: inp, output: out };
+}
+
+function RelevantGuideBulletList({ items }: { items: string[] }) {
+  return (
+    <ul className="text-xs text-muted-foreground list-disc pl-3.5 space-y-0.5 min-w-[200px] max-w-[320px]">
+      {items.map((t, i) => (
+        <li key={i}>{t}</li>
+      ))}
+    </ul>
+  );
+}
+
+function RelevantGuidePriceCell({
+  row,
+  live,
+  hasLivePricing,
+}: {
+  row: RelevantModelGuideRow;
+  live: { input: number | null; output: number | null };
+  hasLivePricing: boolean;
+}) {
+  if (row.hideApiPricing) {
+    return (
+      <div className="text-xs text-right space-y-0.5">
+        <div className="text-muted-foreground">—</div>
+        <div className="text-[10px] text-muted-foreground/85 leading-snug">
+          Cible inférence locale ; tarif API éventuel dans le catalogue ci‑dessous
+        </div>
+      </div>
+    );
+  }
+  const approxDoc = row.pricingApprox && !hasLivePricing;
+  const pfx = approxDoc ? "~" : "";
+  if (hasLivePricing) {
+    const a = fmtUsdLocaleShort(live.input);
+    const b = fmtUsdLocaleShort(live.output);
+    return (
+      <div className="text-xs text-right space-y-0.5">
+        <div className="font-mono">
+          {pfx}
+          {a ?? "—"} $ / {b ?? "—"} $
+        </div>
+        <div className="text-[10px] text-muted-foreground">Entrée · sortie · 1M tok. (OpenRouter)</div>
+      </div>
+    );
+  }
+  const s = row.staticPricingUsdPer1m;
+  if (!s) {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  return (
+    <div className="text-xs text-right space-y-0.5">
+      <div className="font-mono">
+        {pfx}
+        {fmtUsdLocaleShort(s.input)} $ / {fmtUsdLocaleShort(s.output)} $
+      </div>
+      <div className="text-[10px] text-muted-foreground">Indicatif (hors sync catalogue)</div>
+    </div>
+  );
 }
 
 /** Catégorie open‑source / API propriétaire, avec heuristique si le catalogue ne classe pas le modèle. */
@@ -279,9 +353,7 @@ function compareCatalogModels(a: CatalogModel, b: CatalogModel, sort: CatalogSor
   return cmpLocaleStr(a.id, b.id, "asc");
 }
 
-type UsageRowWithScore = UsageRow & { score: number };
-
-function compareUsageRows(a: UsageRowWithScore, b: UsageRowWithScore, sort: UsageSortState): number {
+function compareUsageRows(a: UsageRow, b: UsageRow, sort: UsageSortState): number {
   const { key, dir } = sort;
   let primary = 0;
   switch (key) {
@@ -310,18 +382,12 @@ function compareUsageRows(a: UsageRowWithScore, b: UsageRowWithScore, sort: Usag
     case "avg_total_tokens":
       primary = cmpNullableNumber(a.avg_total_tokens, b.avg_total_tokens, dir);
       break;
-    case "note":
-      primary = cmpNullableNumber(a.feedback?.avg_rating ?? null, b.feedback?.avg_rating ?? null, dir);
-      break;
     case "satisfaction":
       primary = cmpNullableNumber(
         a.feedback?.satisfaction_rate ?? null,
         b.feedback?.satisfaction_rate ?? null,
         dir,
       );
-      break;
-    case "score":
-      primary = cmpNullableNumber(a.score, b.score, dir);
       break;
     case "local_vram":
       primary = cmpNullableNumber(
@@ -369,20 +435,6 @@ function CatalogContextCell({ m }: { m: CatalogModel }) {
       )}
     </div>
   );
-}
-
-function rowScore(u: UsageRow): number {
-  const fb = u.feedback;
-  const maxTime = 120_000;
-  const t = u.avg_response_time_ms ?? maxTime;
-  const vitesse = Math.max(0, 1 - Math.min(t, maxTime) / maxTime);
-  const note = fb ? (fb.avg_rating / 10) * 0.4 : 0;
-  const sat = fb ? (fb.satisfaction_rate / 100) * 0.3 : 0;
-  const cost = u.avg_cost_per_run_usd;
-  const costScore =
-    cost != null && cost > 0 ? Math.max(0, 1 - Math.min(cost * 5000, 1)) * 0.3 : vitesse * 0.3;
-  if (fb) return Math.round((note + sat + vitesse * 0.3) * 1000) / 1000;
-  return Math.round((vitesse * 0.5 + costScore) * 1000) / 1000;
 }
 
 function HardwareHint({ h }: { h: Record<string, unknown> | null | undefined }) {
@@ -616,10 +668,7 @@ export default function LLMComparator() {
       .finally(() => setLoading(false));
   }, []);
 
-  const usageRowsWithScore = useMemo((): UsageRowWithScore[] => {
-    if (!data?.usage_rows) return [];
-    return data.usage_rows.map((u) => ({ ...u, score: rowScore(u) }));
-  }, [data]);
+  const usageRows = useMemo((): UsageRow[] => data?.usage_rows ?? [], [data]);
 
   // Debug simple : comptage des catégories côté front au chargement.
   useEffect(() => {
@@ -634,10 +683,10 @@ export default function LLMComparator() {
   }, [data]);
 
   const sortedUsageRows = useMemo(() => {
-    const rows = [...usageRowsWithScore];
+    const rows = [...usageRows];
     rows.sort((a, b) => compareUsageRows(a, b, usageSort));
     return rows;
-  }, [usageRowsWithScore, usageSort]);
+  }, [usageRows, usageSort]);
 
   const filteredCatalog = useMemo(() => {
     if (!data?.model_catalog) return [];
@@ -668,6 +717,18 @@ export default function LLMComparator() {
     rows.sort((a, b) => compareCatalogModels(a, b, catalogSort));
     return rows;
   }, [filteredCatalog, catalogSort]);
+
+  const relevantGuideEnriched = useMemo(() => {
+    const cat = data?.model_catalog;
+    return [...RELEVANT_MODEL_GUIDE]
+      .sort((a, b) => a.order - b.order)
+      .map((row) => {
+        const matched = findCatalogMatchForRelevantGuide(cat, row.matchPrefixes);
+        const live = readCatalogPricingUsdPer1m(matched);
+        const hasLivePricing = live.input != null || live.output != null;
+        return { row, matched, live, hasLivePricing };
+      });
+  }, [data?.model_catalog]);
 
   const onCatalogSortKey = (key: CatalogSortKey) => {
     setCatalogSort((s) => toggleCatalogSort(s, key));
@@ -703,7 +764,7 @@ export default function LLMComparator() {
         <div>
           <h1 className="text-2xl font-bold text-foreground">Comparateur de modèles</h1>
           <p className="text-sm text-muted-foreground mt-1 max-w-3xl">
-            Tarifs OpenRouter (API), coûts et latences observés sur vos requêtes RAG, notes optionnelles
+            Tarifs OpenRouter (API), coûts et latences observés sur vos requêtes RAG, retours pouce haut / bas
             par message, et repères matériel pour un déploiement local (estimations — voir sources
             citées).
           </p>
@@ -740,13 +801,13 @@ export default function LLMComparator() {
           <h2 className="text-lg font-semibold">Activité et retours par modèle</h2>
           <p className="text-xs text-muted-foreground">
             Cliquez sur un en-tête pour trier. Même colonne : sens inversé. Au premier clic : modèle A→Z ;
-            runs, tokens, note, satisfaction et score du plus élevé au plus bas ; latences et coûts du plus
+            runs, tokens et satisfaction (% de pouces haut) du plus élevé au plus bas ; latences et coûts du plus
             bas au plus haut ; VRAM locale du plus grand au plus petit. Les valeurs manquantes sont en bas.
           </p>
           {sortedUsageRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Aucune génération enregistrée pour l’instant. Utilisez l’assistant : chaque réponse alimente
-              cette section. Les notes sous les messages enrichissent les colonnes « Note » et « Satisfaction ».
+              cette section. Les pouces sous les réponses de l’assistant alimentent la colonne « Satisfaction ».
             </p>
           ) : (
             <div className="rounded-xl border border-border overflow-x-auto shadow-sm">
@@ -795,22 +856,15 @@ export default function LLMComparator() {
                       align="right"
                     />
                     <UsageSortableHead
-                      label="Tokens moyens utilisés"
+                      label="Tokens"
                       sortKey="avg_total_tokens"
                       sort={usageSort}
                       onSort={onUsageSortKey}
                       align="right"
                     />
                     <UsageSortableHead
-                      label="Note moyenne (/10)"
-                      sortKey="note"
-                      sort={usageSort}
-                      onSort={onUsageSortKey}
-                      align="right"
-                    />
-                    <UsageSortableHead
-                      label="Score"
-                      sortKey="score"
+                      label="Satisfaction"
+                      sortKey="satisfaction"
                       sort={usageSort}
                       onSort={onUsageSortKey}
                       align="right"
@@ -832,9 +886,10 @@ export default function LLMComparator() {
                       <TableCell className="text-right">{fmtUsd(u.avg_cost_per_run_usd, 4)}</TableCell>
                       <TableCell className="text-right">{fmtNum(u.avg_total_tokens)}</TableCell>
                       <TableCell className="text-right">
-                        {u.feedback?.avg_rating != null ? u.feedback.avg_rating.toFixed(1) : "—"}
+                        {u.feedback?.satisfaction_rate != null
+                          ? `${u.feedback.satisfaction_rate.toFixed(1)} %`
+                          : "—"}
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs">{u.score.toFixed(2)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -844,13 +899,70 @@ export default function LLMComparator() {
         </section>
 
         <section className="space-y-3">
-          <h2 className="text-lg font-semibold">Catalogue OpenRouter — tarifs indicatifs</h2>
+          <h2 className="text-lg font-semibold">Modèles pertinents pour notre usage (RAG interne)</h2>
+          <p className="text-xs text-muted-foreground max-w-3xl">
+            Sélection méthodologique : API propriétaires d’abord (usage cloud), puis familles open‑source (souvent
+            auto‑hébergées). Lorsqu’un ID OpenRouter correspond, les tarifs de la colonne prix sont repris du catalogue
+            temps réel ; sinon ce sont des ordres de grandeur documentaires (les montants ~ sont estimés).
+          </p>
+          <div className="rounded-xl border border-border overflow-x-auto shadow-sm">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="min-w-[160px]">Modèle</TableHead>
+                  <TableHead className="min-w-[100px]">Type</TableHead>
+                  <TableHead className="text-right min-w-[150px]">Prix API ($ / 1M tokens)</TableHead>
+                  <TableHead className="min-w-[220px]">Points forts</TableHead>
+                  <TableHead className="min-w-[220px]">Points faibles</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {relevantGuideEnriched.map(({ row, matched, live, hasLivePricing }) => (
+                  <TableRow key={`${row.order}-${row.label}`}>
+                    <TableCell className="align-top">
+                      <div className="font-medium leading-snug">{row.label}</div>
+                      <div className="text-[11px] text-muted-foreground">{row.vendor}</div>
+                      {matched?.id ? (
+                        <div className="text-[10px] font-mono text-muted-foreground/90 truncate max-w-[240px] mt-1" title={matched.id}>
+                          {matched.id}
+                        </div>
+                      ) : null}
+                    </TableCell>
+                    <TableCell className="align-top text-xs">
+                      {row.kind === "proprietary_api" ? (
+                        <span className="inline-flex rounded-md border border-border bg-muted/40 px-2 py-0.5 text-[11px]">
+                          API propriétaire
+                        </span>
+                      ) : (
+                        <span className="inline-flex rounded-md border border-border bg-muted/40 px-2 py-0.5 text-[11px]">
+                          Open‑source
+                        </span>
+                      )}
+                    </TableCell>
+                    <TableCell className="align-top">
+                      <RelevantGuidePriceCell row={row} live={live} hasLivePricing={hasLivePricing} />
+                    </TableCell>
+                    <TableCell className="align-top">
+                      <RelevantGuideBulletList items={row.strengths} />
+                    </TableCell>
+                    <TableCell className="align-top">
+                      <RelevantGuideBulletList items={row.weaknesses} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </section>
+
+        <section className="space-y-3">
+          <h2 className="text-lg font-semibold">Catalogue OpenRouter complet</h2>
           <p className="text-xs text-muted-foreground">
-            Prix par million de tokens tels que renvoyés par l’API OpenRouter : colonnes « input / output » sont
-            normalisées à partir du bloc pricing OpenRouter. Cliquez sur un en-tête pour trier : même colonne = sens
-            inversé ; colonne prix ouvre sur le moins cher d’abord, contexte et VRAM locale sur le plus grand
-            d’abord. Les valeurs manquantes sont en bas. Le filtre ci-dessous permet aussi de limiter aux modèles
-            open-source ou non open-source.
+            Liste exhaustive des modèles exposés par l’API (hors routeurs internes et offres gratuites filtrées côté
+            serveur). Prix par million de tokens : colonnes « input / output » normalisées depuis OpenRouter. Cliquez
+            sur un en-tête pour trier : même colonne = sens inversé ; prix du moins cher d’abord ; contexte et VRAM
+            locale du plus grand d’abord. Les valeurs manquantes sont en bas. Le filtre permet de limiter aux modèles
+            open‑source ou API propriétaire.
           </p>
           <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
             <Input

@@ -9,7 +9,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import admin_user, chat, embed, feedback, health, llm
+from api.routes import admin_user, chat, embed, feedback, game_questions, health, llm
 from config import settings
 from core.pipeline_instance import get_pipeline, _pipeline
 from core.supabase_sync import sync_supabase_knowledge_to_qdrant
@@ -73,6 +73,7 @@ app.include_router(embed.router, tags=["embed"])
 app.include_router(admin_user.router, tags=["admin"])
 app.include_router(llm.router, prefix="/api", tags=["llm"])
 app.include_router(feedback.router, prefix="/api", tags=["feedback"])
+app.include_router(game_questions.router, prefix="/api", tags=["assistant-game-questions"])
 
 
 if __name__ == "__main__":
