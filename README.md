@@ -3,6 +3,8 @@
 Plateforme d'assistance IA pour les employés d'une société de télécom.
 Les utilisateurs interrogent en langage naturel la base documentaire interne, et reçoivent une réponse en français, argumentée et sourcée.
 
+**État actuel de l’infra :** l’**authentification** des utilisateurs et le **stockage** des fichiers / métadonnées documentaires passent par **Supabase** (Auth, Storage, PostgreSQL). Telko **ne s’appuie pas sur Azure AD** pour la connexion des utilisateurs **ni sur un stockage Azure** (Blob, etc.) pour les documents. Une intégration **SharePoint** optionnelle peut, elle seule, exiger une application **Microsoft Entra ID** (identifiants « machine à machine » pour Microsoft Graph), distincte de l’auth utilisateur de l’app.
+
 ---
 
 ## Vue d'ensemble fonctionnelle :
@@ -20,7 +22,7 @@ Les utilisateurs interrogent en langage naturel la base documentaire interne, et
    - les documents sources qui ont servi au raisonnement.
 
 En production, Telko est pensé comme un **assistant centralisé** qui s'appuie sur :
-- **Supabase** pour stocker les documents structurés ;
+- **Supabase** pour l’auth utilisateurs, le stockage des fichiers, et les documents structurés (`knowledge_documents`, etc.) ;
 - **Qdrant** comme base vectorielle (RAG) pour la recherche sémantique ;
 - **OpenRouter** comme passerelle vers les modèles LLM et embeddings.
 
@@ -45,7 +47,7 @@ En production, Telko est pensé comme un **assistant centralisé** qui s'appuie 
   - indexation simultanée :
     - dans **Supabase** (métadonnées, texte brut) ;
     - dans **Qdrant** (vecteurs pour la recherche sémantique).
-- **Synchronisation automatique SharePoint** :
+- **Synchronisation automatique SharePoint** *(optionnelle — uniquement si vous configurez Microsoft Graph / Entra ID)* :
   - planification via **APScheduler** ;
   - récupération des nouveaux documents / mises à jour via **Microsoft Graph** ;
   - ré-indexation transparente côté Telko.
@@ -53,7 +55,7 @@ En production, Telko est pensé comme un **assistant centralisé** qui s'appuie 
 ### Administration (exposition technique)
 
 - **Gestion des utilisateurs** (route `admin_user.py`) :
-  - dépend de l’authentification **Azure AD** ;
+  - s’appuie sur **Supabase Auth** (JWT utilisateur) et la clé service pour les opérations admin ;
   - permet de contrôler l’accès et, si besoin, de lier des métadonnées (département, rôle…).
 - **Santé de l’API** :
   - endpoint `GET /health` pour vérifier rapidement l’état du backend (sondes de monitoring).
@@ -91,10 +93,10 @@ Frontend React (Vite, Tailwind, shadcn-ui)
     ▼  /api/chat, /api/llm/comparator, /api/documents...
 Backend FastAPI (Python)
     │
-    ├── Supabase       ──► table knowledge_documents (base documentaire « structurée »)
+    ├── Supabase       ──► Auth, Storage, knowledge_documents (pas d’Azure pour auth / fichiers)
     ├── Qdrant         ──► collection telko_knowledge (vecteurs RAG)
     ├── OpenRouter     ──► LLM (chat) + embeddings (RAG, stats coût/token)
-    └── Microsoft Graph (SharePoint) ──► ingestion & sync des documents
+    └── Microsoft Graph (SharePoint, optionnel) ──► sync automatique si configuré
 ```
 
 ### Route de chat (`POST /chat`)
@@ -171,11 +173,10 @@ Ce comparateur s’appuie sur une route backend dédiée (`/api/llm/comparator`)
 | **Python** | 3.11+ (backend FastAPI) |
 | **Docker + Docker Compose** | pour Qdrant et/ou déploiement backend |
 | **Accès OpenRouter** | clé API + configuration site/app |
-| **Supabase** | base de données documentaire (`knowledge_documents`) |
-| **Azure AD** | authentification des utilisateurs |
-| **SharePoint / Microsoft 365** | source documentaire principale (via Microsoft Graph) |
+| **Supabase** | Auth utilisateurs, Storage fichiers, base `knowledge_documents` |
+| **SharePoint / Microsoft 365** | *(optionnel)* sync documentaire via Microsoft Graph + Entra ID (app « daemon ») |
 
-En local, un simple **backend FastAPI + Qdrant + OpenRouter** suffit pour reproduire la majorité des comportements.
+En local, un simple **backend FastAPI + Qdrant + OpenRouter + Supabase** suffit pour reproduire la majorité des comportements (sans SharePoint ni Azure).
 
 ---
 
@@ -203,17 +204,20 @@ QDRANT_URL=https://your-qdrant-endpoint    # ou http://localhost:6333 en dev
 QDRANT_COLLECTION_NAME=telko_knowledge
 QDRANT_API_KEY=...
 
-# Azure AD
+# CORS (origines autorisées pour le frontend)
+ALLOWED_ORIGINS=http://localhost:5173,http://localhost:8080
+```
+
+### Optionnel — synchronisation SharePoint (Microsoft Graph)
+
+Uniquement si vous activez la sync automatique depuis SharePoint. Les identifiants servent au **flux client credentials** vers Graph (compte de service), pas à l’auth des utilisateurs Telko.
+
+```env
 AZURE_TENANT_ID=...
 AZURE_CLIENT_ID=...
 AZURE_CLIENT_SECRET=...
-
-# SharePoint / Microsoft Graph
 SHAREPOINT_SITE_ID=...
 SHAREPOINT_DRIVE_ID=...
-
-# CORS (origines autorisées pour le frontend)
-ALLOWED_ORIGINS=http://localhost:5173,http://localhost:8080
 ```
 
 > Le champ `OPENAI_API_KEY` existe encore pour compatibilité avec l’ancienne architecture,
@@ -300,7 +304,7 @@ telko/
 │   │       ├── admin_user.py    # Administration utilisateurs
 │   │       └── health.py        # GET /health
 │   ├── auth/
-│   │   └── azure_ad.py          # Validation tokens Azure AD
+│   │   └── azure_ad.py          # Module JWT Azure AD (non utilisé sur les routes principales ; auth app = Supabase)
 │   ├── core/
 │   │   ├── llm/                 # Abstraction LLM (OpenRouter provider, BaseLLMProvider)
 │   │   ├── rag_pipeline.py      # RAGPipeline — Qdrant + OpenRouter
@@ -352,14 +356,12 @@ python -m backend.scripts.test_llm
 | **Embeddings (RAG)** | OpenRouter (`text-embedding-3-small`, 1536 dims) |
 | **Vector store RAG** | Qdrant (local ou managé) |
 | **Base documentaire structurée** | Supabase (`knowledge_documents`) |
-| **Auth** | Azure AD (tokens JWT vérifiés côté backend) |
+| **Stockage fichiers (UI / upload)** | Supabase Storage |
+| **Auth** | Supabase Auth (JWT côté frontend et routes protégées du backend) |
 | **Ingestion fichiers** | PyMuPDF, python-docx, python-pptx, pytesseract |
-| **Sync documents** | Microsoft Graph API + APScheduler (SharePoint → Telko) |
+| **Sync documents** | *(optionnel)* Microsoft Graph + APScheduler (SharePoint → Telko) |
 | **Comparateur LLM** | Route `/api/llm/comparator` + page React `LLMComparator` |
 | **Observabilité coût/perf LLM** | Agrégation des `usage` OpenRouter (tokens + coût) côté backend |
 | **Conteneurisation** | Docker, Docker Compose |
 
-Telko est conçu pour fonctionner aussi bien :
-- **en dev local** (backend + frontend + Qdrant local + OpenRouter) ;
-- qu’**en prod** sur une infra cloud (backend conteneurisé, Qdrant/Supabase/OpenRouter managés,
-  intégration Azure AD/SharePoint existantes).
+Telko est conçu pour fonctionner aussi bien **en dev local** (backend, frontend, Qdrant, OpenRouter, Supabase) qu’**en prod** (services managés). La synchro **SharePoint** est **optionnelle** ; c’est la seule partie du dépôt qui utilise des identifiants **Microsoft Entra ID** pour Microsoft Graph.
