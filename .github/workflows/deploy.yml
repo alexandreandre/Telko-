@@ -184,7 +184,8 @@ jobs:
           region: ${{ env.GCP_REGION }}
           image: ${{ needs.build-and-push.outputs.backend_image }}
           # Service backend public (accessible depuis le frontend et le navigateur)
-          flags: --port=8000 --allow-unauthenticated
+          # --timeout doit rester >= LLM_TIMEOUT (Open WebUI / RAG peut dépasser 120 s).
+          flags: --port=8000 --allow-unauthenticated --timeout=${{ vars.BACKEND_REQUEST_TIMEOUT_SECONDS || '900' }}
           env_vars: |-
             OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
             OPENWEBUI_BASE_URL=${{ secrets.OPENWEBUI_BASE_URL }}
@@ -199,6 +200,7 @@ jobs:
             QDRANT_URL=${{ needs.deploy-qdrant.outputs.qdrant_url }}
             ALLOWED_ORIGINS=${{ vars.ALLOWED_ORIGINS }}
             LLM_PROVIDER=openrouter
+            LLM_TIMEOUT=${{ vars.LLM_TIMEOUT_SECONDS || '300' }}
           env_vars_update_strategy: merge
 
       - name: Santé backend /health
