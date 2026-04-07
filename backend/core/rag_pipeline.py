@@ -13,6 +13,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import BaseLLMProvider, LLMProviderError, get_llm_provider
+from core.llm.openwebui import OpenWebUIProvider
 from core.vector_store import QdrantStore
 
 logger = logging.getLogger(__name__)
@@ -170,42 +171,71 @@ class RAGPipeline:
         """
         history = self._get_history(conversation_id)
 
-        docs = await self._store.similarity_search(message, k=5)
-        logger.info(
-            "RAGPipeline.stream_query — conv=%s | requête='%s...' | %d document(s) de contexte.",
-            conversation_id,
-            (message[:80] + "…") if len(message) > 80 else message,
-            len(docs),
+        active_llm = llm or self._llm
+        use_openwebui_kb = isinstance(active_llm, OpenWebUIProvider) and bool(
+            getattr(active_llm, "chat_files", None)
         )
-        if not docs:
-            logger.warning(
-                "RAGPipeline.stream_query — aucun document retourné par Qdrant pour conv=%s. "
-                "Vérifier l'ingestion (chunks indexés) et la collection '%s'.",
+
+        if use_openwebui_kb:
+            docs = []
+            embed_usage = {}
+            context = ""
+            logger.info(
+                "RAGPipeline.stream_query — conv=%s | requête='%s...' | RAG Open WebUI (collections/fichiers), Qdrant Telko ignoré.",
                 conversation_id,
-                self._store._collection if hasattr(self._store, "_collection") else "inconnue",
+                (message[:80] + "…") if len(message) > 80 else message,
+            )
+            system_lead = (
+                "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
+                "Open WebUI enrichit cette requête avec des extraits issus de la base de connaissances configurée "
+                "sur l’instance (paramètre `files` de l’API). Réponds en t’appuyant sur le contexte que Open WebUI "
+                "injecte ; si l’information n’y figure pas, dis-le clairement.\n\n"
             )
         else:
-            preview = [
-                {
-                    "source": d.metadata.get("source"),
-                    "filename": d.metadata.get("filename") or d.metadata.get("source"),
-                    "page": d.metadata.get("page"),
-                }
-                for d in docs[:5]
-            ]
-            logger.debug("RAGPipeline.stream_query — premiers documents de contexte: %s", preview)
-        # Usage d'embedding pour la requête (API /embeddings OpenRouter), si disponible
-        embed_usage = self._store.get_last_embeddings_usage() or {}
-        context = _format_context(docs)
+            docs = await self._store.similarity_search(message, k=5)
+            logger.info(
+                "RAGPipeline.stream_query — conv=%s | requête='%s...' | %d document(s) de contexte.",
+                conversation_id,
+                (message[:80] + "…") if len(message) > 80 else message,
+                len(docs),
+            )
+            if not docs:
+                logger.warning(
+                    "RAGPipeline.stream_query — aucun document retourné par Qdrant pour conv=%s. "
+                    "Vérifier l'ingestion (chunks indexés) et la collection '%s'.",
+                    conversation_id,
+                    self._store._collection if hasattr(self._store, "_collection") else "inconnue",
+                )
+            else:
+                preview = [
+                    {
+                        "source": d.metadata.get("source"),
+                        "filename": d.metadata.get("filename") or d.metadata.get("source"),
+                        "page": d.metadata.get("page"),
+                    }
+                    for d in docs[:5]
+                ]
+                logger.debug("RAGPipeline.stream_query — premiers documents de contexte: %s", preview)
+            embed_usage = self._store.get_last_embeddings_usage() or {}
+            context = _format_context(docs)
+            system_lead = (
+                "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
+                "Réponds UNIQUEMENT à partir des documents fournis ci‑dessous. "
+                "Si une information n'est pas explicitement présente dans les documents, dis-le clairement et explique ce qu'il manque.\n\n"
+            )
+
+        doc_block = (
+            f"\n\n=== DOCUMENTS PERTINENTS (base documentaire Telko) ===\n{context}"
+            if not use_openwebui_kb
+            else ""
+        )
 
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
-                    "Réponds UNIQUEMENT à partir des documents fournis ci‑dessous. "
-                    "Si une information n'est pas explicitement présente dans les documents, dis-le clairement et explique ce qu'il manque.\n\n"
-                    "Mise en forme attendue (Markdown) :\n"
+                    system_lead
+                    + "Mise en forme attendue (Markdown) :\n"
                     "- Utilise des titres de niveau 2 (`##`) pour structurer ta réponse (par exemple `## Résumé`, `## Détails`, `## Actions recommandées`).\n"
                     "- Utilise des listes à puces pour énumérer des points.\n"
                     "- Mets en **gras** les éléments importants (décisions, chiffres clés, avertissements).\n"
@@ -216,9 +246,8 @@ class RAGPipeline:
                     "- Dans `## Sources`, liste uniquement les documents réellement utilisés pour répondre, sous forme de liens Markdown cliquables :\n"
                     "  - `- [nom_du_fichier – page X](#)` si tu ne connais pas l'URL exacte,\n"
                     "  - ou `- [nom_du_fichier – page X](URL_COMPLÈTE)` si l'URL est présente dans le texte du contexte.\n\n"
-                    f"L'utilisateur est {role_name or 'un collaborateur'} dans le département {department or 'non précisé'}.\n\n"
-                    "=== DOCUMENTS PERTINENTS ===\n"
-                    f"{context}"
+                    f"L'utilisateur est {role_name or 'un collaborateur'} dans le département {department or 'non précisé'}."
+                    f"{doc_block}"
                 ),
             },
             # Historique : derniers 10 tours = 20 messages, format user/assistant alterné
@@ -232,8 +261,6 @@ class RAGPipeline:
             ],
             {"role": "user", "content": message},
         ]
-
-        active_llm = llm or self._llm
         full_response = ""
         # usage brut renvoyé par le provider (OpenRouter dans notre cas)
         raw_usage: dict[str, Any] | None = None
@@ -257,20 +284,17 @@ class RAGPipeline:
             len(docs),
         )
 
-        # Chunk final avec les métadonnées d'usage (si disponibles)
+        # Chunk final : toujours émettre les métadonnées (latences / journalisation), même si le
+        # provider ne renvoie pas d'usage tokenisé (ex. certaines API Open WebUI en streaming).
+        embed_tokens = {
+            "prompt_tokens": embed_usage.get("prompt_tokens"),
+            "total_tokens": embed_usage.get("total_tokens"),
+        }
         if raw_usage is not None:
-            # Normalisation pour l'UI et le comparateur :
-            # - usage.llm : tokens prompt / complétion / total
-            # - usage.embeddings : tokens utilisés pour la requête (OpenRouter embeddings)
-            # - usage.cost : découpe coût LLM / embeddings / total
             llm_tokens = {
                 "prompt_tokens": raw_usage.get("prompt_tokens"),
                 "completion_tokens": raw_usage.get("completion_tokens"),
                 "total_tokens": raw_usage.get("total_tokens"),
-            }
-            embed_tokens = {
-                "prompt_tokens": embed_usage.get("prompt_tokens"),
-                "total_tokens": embed_usage.get("total_tokens"),
             }
             cost_total = raw_usage.get("cost")
             usage_struct = {
@@ -278,14 +302,27 @@ class RAGPipeline:
                 "embeddings": embed_tokens,
                 "cost": {
                     "llm_usd": cost_total,
-                    # Le endpoint /embeddings ne renvoie pas encore de coût direct ;
-                    # on laisse ce champ pour évolution future.
                     "embeddings_usd": None,
                     "total_usd": cost_total,
                 },
                 "raw": raw_usage,
             }
-            yield {"type": "meta", "usage": usage_struct}
+        else:
+            usage_struct = {
+                "llm": {
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                },
+                "embeddings": embed_tokens,
+                "cost": {
+                    "llm_usd": None,
+                    "embeddings_usd": None,
+                    "total_usd": None,
+                },
+                "raw": None,
+            }
+        yield {"type": "meta", "usage": usage_struct}
 
 
 # ---------------------------------------------------------------------------

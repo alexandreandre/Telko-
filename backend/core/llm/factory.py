@@ -8,6 +8,7 @@ from core.llm.mistral_api import MistralAPIProvider
 from core.llm.ollama import OllamaProvider
 from core.llm.openai import OpenAIProvider
 from core.llm.openrouter import OpenRouterProvider
+from core.llm.openwebui import OpenWebUIProvider, build_openwebui_chat_files
 
 _REGISTRY: dict[str, type[BaseLLMProvider]] = {
     "ollama": OllamaProvider,
@@ -16,6 +17,7 @@ _REGISTRY: dict[str, type[BaseLLMProvider]] = {
     "anthropic": AnthropicProvider,
     "mistral-api": MistralAPIProvider,
     "openrouter": OpenRouterProvider,
+    "openwebui": OpenWebUIProvider,
 }
 
 # Cache par (provider, model) — une instance par combinaison
@@ -49,8 +51,19 @@ def get_llm_provider(
         "anthropic": "claude-3-haiku-20240307",
         "mistral-api": "mistral-small-latest",
         "openrouter": settings.openrouter_llm_model,
+        "openwebui": settings.openwebui_model,
     }
-    resolved_model = model or default_models.get(provider_name, "")
+
+    if provider_name == "openwebui":
+        if not settings.openwebui_base_url.strip() or not settings.openwebui_api_key.strip():
+            raise ValueError(
+                "Open WebUI : renseigner OPENWEBUI_BASE_URL et OPENWEBUI_API_KEY côté backend."
+            )
+        if not settings.openwebui_model.strip():
+            raise ValueError("Open WebUI : renseigner OPENWEBUI_MODEL (identifiant modèle côté instance).")
+        resolved_model = settings.openwebui_model.strip()
+    else:
+        resolved_model = model or default_models.get(provider_name, "")
 
     cache_key = (provider_name, resolved_model)
     if cache_key in _instances:
@@ -72,6 +85,14 @@ def get_llm_provider(
             api_key=settings.openrouter_api_key,
             model=resolved_model,
             timeout=getattr(settings, "llm_timeout", 120.0),
+        )
+    elif provider_name == "openwebui":
+        instance = OpenWebUIProvider(
+            base_url=settings.openwebui_base_url.strip(),
+            api_key=settings.openwebui_api_key.strip(),
+            model=resolved_model,
+            timeout=getattr(settings, "llm_timeout", 120.0),
+            chat_files=build_openwebui_chat_files(),
         )
     elif provider_name == "gemini":
         instance = GeminiProvider(

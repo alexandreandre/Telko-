@@ -170,6 +170,11 @@ jobs:
           flags: --port=8000 --allow-unauthenticated
           env_vars: |-
             OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+            OPENWEBUI_BASE_URL=${{ secrets.OPENWEBUI_BASE_URL }}
+            OPENWEBUI_API_KEY=${{ secrets.OPENWEBUI_API_KEY }}
+            OPENWEBUI_MODEL=${{ secrets.OPENWEBUI_MODEL }}
+            OPENWEBUI_KNOWLEDGE_COLLECTION_ID=${{ secrets.OPENWEBUI_KNOWLEDGE_COLLECTION_ID }}
+            OPENWEBUI_CHAT_FILES_JSON=${{ secrets.OPENWEBUI_CHAT_FILES_JSON }}
             SUPABASE_URL=${{ secrets.SUPABASE_URL }}
             SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
             SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
