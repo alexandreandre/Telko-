@@ -1,6 +1,6 @@
 """
 POST /embed-document — équivalent Edge Function `embed-document`.
-Génère un embedding (logique OpenAI identique à Deno) et insère dans `knowledge_documents`.
+Génère un embedding via OpenRouter (/v1/embeddings) et insère dans `knowledge_documents`.
 """
 
 import json
@@ -11,11 +11,15 @@ from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from api.supabase_auth import get_supabase_user_id
 from config import settings
 from core.pipeline_instance import get_pipeline
 
 router = APIRouter()
 pipeline = get_pipeline()
+
+# Aligné sur Qdrant / OpenRouterEmbeddings (ex. text-embedding-3-small → 1536).
+_TARGET_EMBEDDING_DIM = 1536
 
 
 class EmbedBody(BaseModel):
@@ -34,89 +38,56 @@ def _rest_headers_user(access_token: str) -> dict[str, str]:
     }
 
 
-async def _get_user_id(client: httpx.AsyncClient, access_token: str) -> str | None:
-    r = await client.get(
-        f"{settings.supabase_url.rstrip('/')}/auth/v1/user",
-        headers={
-            "apikey": settings.supabase_anon_key,
-            "Authorization": f"Bearer {access_token}",
-        },
-    )
-    if r.status_code != 200:
+def _openrouter_embedding_headers() -> dict[str, str] | None:
+    key = (settings.openrouter_api_key or "").strip()
+    if not key:
         return None
-    data = r.json()
-    return data.get("id")
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if settings.openrouter_site_url:
+        headers["HTTP-Referer"] = settings.openrouter_site_url
+    if settings.openrouter_app_title:
+        headers["X-OpenRouter-Title"] = settings.openrouter_app_title
+    return headers
 
 
 async def _generate_embedding(client: httpx.AsyncClient, title: str, content: str) -> list[float] | None:
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an embedding generator. Given the following document, return ONLY a JSON array "
-                    "of exactly 768 floating point numbers between -1 and 1 that represent the semantic meaning "
-                    "of the text. The numbers should capture the key concepts, topics, and meaning. "
-                    "Return ONLY the JSON array, nothing else."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Title: {title}\n\nContent: {content[:4000]}",
-            },
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "store_embedding",
-                    "description": "Store the semantic embedding vector for this document",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "embedding": {
-                                "type": "array",
-                                "items": {"type": "number"},
-                                "description": "Array of exactly 768 floating point numbers representing the document embedding",
-                            },
-                        },
-                        "required": ["embedding"],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        ],
-        "tool_choice": {"type": "function", "function": {"name": "store_embedding"}},
-    }
+    headers = _openrouter_embedding_headers()
+    if not headers:
+        return None
+
+    text = f"Title: {title}\n\nContent: {content[:4000]}"
     r = await client.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
+        "https://openrouter.ai/api/v1/embeddings",
+        headers=headers,
+        json={
+            "model": settings.openrouter_embeddings_model,
+            "input": text,
         },
-        json=body,
     )
     if not r.is_success:
         return None
-    emb_data = r.json()
+    data = r.json()
+    items = data.get("data") or []
+    if not items or not isinstance(items, list):
+        return None
+    emb = items[0].get("embedding")
+    if not isinstance(emb, list):
+        return None
     try:
-        tool_call = emb_data["choices"][0]["message"]["tool_calls"][0]
-        args = json.loads(tool_call["function"]["arguments"])
-        emb = args.get("embedding")
-        if isinstance(emb, list):
-            return emb
-    except (KeyError, IndexError, json.JSONDecodeError, TypeError):
-        pass
-    return None
+        return [float(x) for x in emb]
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_embedding(embedding: list[float]) -> list[float]:
-    if len(embedding) == 768:
+    if len(embedding) == _TARGET_EMBEDDING_DIM:
         return embedding
-    if len(embedding) > 768:
-        return embedding[:768]
-    return embedding + [0.0] * (768 - len(embedding))
+    if len(embedding) > _TARGET_EMBEDDING_DIM:
+        return embedding[:_TARGET_EMBEDDING_DIM]
+    return embedding + [0.0] * (_TARGET_EMBEDDING_DIM - len(embedding))
 
 
 async def _insert_document(
@@ -149,7 +120,7 @@ async def embed_document(
         return JSONResponse(status_code=400, content={"error": "Titre et contenu requis"})
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        user_id = await _get_user_id(client, access_token)
+        user_id = await get_supabase_user_id(client, access_token)
         if not user_id:
             return JSONResponse(status_code=401, content={"error": "Non authentifié"})
 

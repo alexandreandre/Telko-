@@ -1,7 +1,4 @@
-const PDF_PLACEHOLDER_PATTERN = /^\[Fichier PDF:\s*.+\]$/i;
-
-export const isPdfPlaceholderContent = (content: string): boolean =>
-  PDF_PLACEHOLDER_PATTERN.test(content.trim());
+export { isKnowledgeFilePlaceholder as isPdfPlaceholderContent } from "@/lib/knowledge-files";
 
 interface ExtractPdfTextOptions {
   maxPages?: number;

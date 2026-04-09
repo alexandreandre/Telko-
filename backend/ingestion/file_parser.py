@@ -1,6 +1,7 @@
 """
 Parseur de fichiers multi-format.
-Extrait le texte brut depuis des fichiers PDF, DOCX, XLSX, PPTX et TXT.
+Extrait le texte brut depuis des fichiers PDF, Word, Excel, PowerPoint (y compris
+formats binaires .doc / .xls / .ppt lorsque les outils système sont disponibles), TXT, etc.
 Retourne des Documents LangChain avec metadata complètes (source, filename,
 page, file_type, last_modified). Fichier illisible ou vide → warning + [].
 """
@@ -16,11 +17,21 @@ logger = logging.getLogger(__name__)
 
 # Extensions supportées
 _SUPPORTED_EXTENSIONS = {
-    ".pdf", ".docx", ".pptx",
-    ".jpg", ".jpeg", ".png",
-    ".txt", ".md",
-    ".csv", ".xlsx",
-    ".json", ".html",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".txt",
+    ".md",
+    ".csv",
+    ".json",
+    ".html",
 }
 
 
@@ -283,6 +294,130 @@ def _parse_xlsx(file_path: str, base_meta: dict) -> list[Document]:
     return docs
 
 
+def _parse_xls(file_path: str, base_meta: dict) -> list[Document]:
+    """
+    Parse un classeur Excel binaire (.xls) avec xlrd.
+    Chaque feuille = un Document avec metadata sheet_name.
+    """
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise ImportError("xlrd est requis pour les fichiers .xls : pip install xlrd") from exc
+
+    try:
+        book = xlrd.open_workbook(file_path, formatting_info=False)
+    except Exception as exc:
+        logger.warning("XLS illisible '%s' : %s", file_path, exc)
+        return []
+
+    docs: list[Document] = []
+    for sheet_idx in range(book.nsheets):
+        sheet = book.sheet_by_index(sheet_idx)
+        if sheet.nrows == 0:
+            continue
+        headers = [str(sheet.cell_value(0, c)).strip() for c in range(sheet.ncols)]
+        lines: list[str] = []
+        for r in range(1, sheet.nrows):
+            row_vals: list[str] = []
+            for c in range(sheet.ncols):
+                cell = sheet.cell(r, c)
+                val = cell.value
+                if cell.ctype == xlrd.XL_CELL_NUMBER and val == int(val):
+                    val = int(val)
+                row_vals.append(str(val).strip() if val is not None else "")
+            entry = " | ".join(
+                f"{headers[i]}: {row_vals[i]}"
+                for i in range(min(len(headers), len(row_vals)))
+                if row_vals[i]
+            )
+            if entry.strip():
+                lines.append(entry)
+        if lines:
+            sheet_meta = {**base_meta, "sheet_name": sheet.title}
+            docs.append(
+                Document(
+                    page_content="\n".join(lines),
+                    metadata={**sheet_meta, "page": sheet.title},
+                )
+            )
+
+    if not docs:
+        logger.warning("XLS vide ou sans données : '%s'.", file_path)
+    return docs
+
+
+def _parse_doc_bin(file_path: str, base_meta: dict) -> list[Document]:
+    """
+    Extrait le texte d'un Word 97–2003 (.doc) via antiword (binaire système).
+    """
+    import shutil
+    import subprocess
+
+    antiword = shutil.which("antiword")
+    if not antiword:
+        logger.warning(
+            "antiword introuvable — impossible d'extraire le .doc '%s' "
+            "(apt install antiword / brew install antiword).",
+            file_path,
+        )
+        return []
+
+    try:
+        r = subprocess.run(
+            [antiword, file_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("antiword timeout sur '%s'.", file_path)
+        return []
+
+    text = (r.stdout or "").strip()
+    if not text:
+        logger.warning("antiword n'a renvoyé aucun texte pour '%s'.", file_path)
+        return []
+
+    return [_make_doc(text, 1, base_meta)]
+
+
+def _parse_ppt_bin(file_path: str, base_meta: dict) -> list[Document]:
+    """
+    Extrait le texte d'un PowerPoint 97–2003 (.ppt) via catppt (paquet catdoc).
+    """
+    import shutil
+    import subprocess
+
+    catppt = shutil.which("catppt")
+    if not catppt:
+        logger.warning(
+            "catppt introuvable — impossible d'extraire le .ppt '%s' "
+            "(apt install catdoc).",
+            file_path,
+        )
+        return []
+
+    try:
+        r = subprocess.run(
+            [catppt, file_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("catppt timeout sur '%s'.", file_path)
+        return []
+
+    text = (r.stdout or "").strip()
+    if not text:
+        logger.warning("catppt n'a renvoyé aucun texte pour '%s'.", file_path)
+        return []
+
+    return [_make_doc(text, 1, base_meta)]
+
+
 def _parse_json(file_path: str, base_meta: dict) -> list[Document]:
     """
     Parse un fichier JSON.
@@ -374,16 +509,19 @@ def _parse_html(file_path: str, base_meta: dict) -> list[Document]:
 # ---------------------------------------------------------------------------
 
 _PARSERS = {
-    ".pdf":  _parse_pdf,
+    ".pdf": _parse_pdf,
+    ".doc": _parse_doc_bin,
     ".docx": _parse_docx,
+    ".ppt": _parse_ppt_bin,
     ".pptx": _parse_pptx,
-    ".jpg":  _parse_image,
-    ".jpeg": _parse_image,
-    ".png":  _parse_image,
-    ".txt":  _parse_txt,
-    ".md":   _parse_md,
-    ".csv":  _parse_csv,
+    ".xls": _parse_xls,
     ".xlsx": _parse_xlsx,
+    ".jpg": _parse_image,
+    ".jpeg": _parse_image,
+    ".png": _parse_image,
+    ".txt": _parse_txt,
+    ".md": _parse_md,
+    ".csv": _parse_csv,
     ".json": _parse_json,
     ".html": _parse_html,
 }
@@ -393,7 +531,8 @@ def parse_file(file_path: str) -> list[Document]:
     """
     Parse un fichier et retourne une liste de Documents LangChain.
 
-    Formats supportés : .pdf, .docx, .pptx, .jpg, .jpeg, .png, .txt, .md, .csv, .xlsx, .json, .html
+    Formats supportés : .pdf, .doc, .docx, .ppt, .pptx, .xls, .xlsx, .jpg, .jpeg, .png,
+    .txt, .md, .csv, .json, .html
 
     Chaque Document contient :
       - page_content : texte extrait
@@ -431,6 +570,33 @@ def parse_file(file_path: str) -> list[Document]:
     docs = parser(file_path, base_meta)
     logger.info("'%s' → %d Document(s) extraits.", p.name, len(docs))
     return docs
+
+
+def documents_to_plain_text(docs: list[Document], max_chars: int = 1_000_000) -> str:
+    """
+    Concatène les Documents issus de parse_file en un seul texte pour indexation / embedding.
+    """
+    if not docs:
+        return ""
+    parts: list[str] = []
+    for d in docs:
+        meta = d.metadata or {}
+        sheet = meta.get("sheet_name")
+        page = meta.get("page")
+        label_bits: list[str] = []
+        if sheet:
+            label_bits.append(f"Feuille: {sheet}")
+        if page not in (None, "") and str(page) != str(sheet):
+            label_bits.append(f"Bloc: {page}")
+        block = (d.page_content or "").strip()
+        if label_bits:
+            block = f"[{' · '.join(label_bits)}]\n{block}"
+        if block:
+            parts.append(block)
+    out = "\n\n".join(parts).strip()
+    if len(out) > max_chars:
+        return out[:max_chars]
+    return out
 
 
 def batch_parse(folder_path: str) -> list[Document]:

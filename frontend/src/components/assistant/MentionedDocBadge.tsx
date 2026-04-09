@@ -1,5 +1,6 @@
-import { X, FileText } from "lucide-react";
+import { X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { getKnowledgeFileKind, knowledgeFileLucideIcon } from "@/lib/knowledge-files";
 import {
   HoverCard,
   HoverCardContent,
@@ -9,15 +10,18 @@ import {
 interface MentionedDocBadgeProps {
   title: string;
   content: string;
+  /** Permet d’afficher la bonne icône (le titre en base est souvent sans extension). */
+  filePath: string | null;
   onRemove: () => void;
 }
 
-export default function MentionedDocBadge({ title, content, onRemove }: MentionedDocBadgeProps) {
+export default function MentionedDocBadge({ title, content, filePath, onRemove }: MentionedDocBadgeProps) {
+  const Icon = knowledgeFileLucideIcon(getKnowledgeFileKind(filePath || title));
   return (
     <HoverCard openDelay={200} closeDelay={100}>
       <HoverCardTrigger asChild>
         <Badge variant="secondary" className="gap-1 text-xs cursor-pointer">
-          <FileText className="h-3 w-3" />
+          <Icon className="h-3 w-3" />
           <span className="max-w-[150px] truncate">{title}</span>
           <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="ml-1 hover:text-destructive">
             <X className="h-3 w-3" />

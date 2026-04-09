@@ -378,6 +378,54 @@ class QdrantStore:
             logger.error("Erreur lors de la recherche Qdrant : %s", exc)
             raise RuntimeError(f"Erreur Qdrant (similarity_search) : {exc}") from exc
 
+    def fetch_all_by_source(self, source_id: str) -> list[Document]:
+        """
+        Récupère tous les points (chunks) dont metadata.source == source_id, via scroll.
+        Utilisé quand l'utilisateur cite un document (@mention) sans envoyer tout le texte au LLM.
+        """
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"Erreur Qdrant (init_collection dans fetch_all_by_source) : {exc}") from exc
+
+        filt = Filter(
+            must=[FieldCondition(key="metadata.source", match=MatchValue(value=source_id))]
+        )
+        out: list[Document] = []
+        offset = None
+
+        while True:
+            try:
+                records, next_offset = self._client.scroll(
+                    collection_name=self._collection,
+                    scroll_filter=filt,
+                    limit=256,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as exc:
+                logger.error("Erreur Qdrant (scroll fetch_all_by_source) : %s", exc)
+                raise RuntimeError(f"Erreur Qdrant (fetch_all_by_source) : {exc}") from exc
+
+            for r in records:
+                payload = r.payload or {}
+                text = payload.get("page_content") or payload.get("text") or ""
+                if not text and isinstance(payload.get("content"), str):
+                    text = payload["content"]
+                meta = payload.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = {}
+                if text:
+                    out.append(Document(page_content=str(text), metadata=dict(meta)))
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        logger.info("fetch_all_by_source('%s') → %d chunk(s).", source_id, len(out))
+        return out
+
     def get_last_embeddings_usage(self) -> dict[str, Any] | None:
         """
         Expose l'usage du dernier appel /embeddings effectué via OpenRouterEmbeddings.

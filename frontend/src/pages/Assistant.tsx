@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import AppLayout from "@/components/AppLayout";
@@ -39,14 +39,10 @@ import ReactMarkdown from "react-markdown";
 import DocumentMention, { type Doc } from "@/components/assistant/DocumentMention";
 import MentionedDocBadge from "@/components/assistant/MentionedDocBadge";
 import { extractPdfText, isPdfPlaceholderContent } from "@/lib/pdf-text";
+import { extractDocumentTextViaApi, getKnowledgeFileKind } from "@/lib/knowledge-files";
 import { getApiBaseUrl } from "@/lib/api";
 import { fetchAssistantGameQuestions, type AssistantGameQuestion } from "@/lib/assistantGameQuestions";
 import { partitionModelsForAssistant } from "@/lib/relevantModels";
-
-interface Msg {
-  role: "user" | "assistant";
-  content: string;
-}
 
 interface MessageMeta {
   provider: string;
@@ -76,6 +72,51 @@ interface MessageMeta {
   };
 }
 
+function assistantExtrasFromMetadata(meta: unknown): {
+  replyMeta?: MessageMeta;
+  rating?: 1 | 2;
+  ratingSent?: boolean;
+} {
+  if (!meta || typeof meta !== "object") return {};
+  const o = meta as Record<string, unknown>;
+  const out: { replyMeta?: MessageMeta; rating?: 1 | 2; ratingSent?: boolean } = {};
+  if (o.response_meta && typeof o.response_meta === "object") {
+    out.replyMeta = o.response_meta as MessageMeta;
+  }
+  if (o.rating === 1 || o.rating === 2) {
+    out.rating = o.rating;
+    out.ratingSent = true;
+  }
+  return out;
+}
+
+interface Msg {
+  id?: string;
+  role: "user" | "assistant";
+  content: string;
+  /** Fichiers mentionnés avec @ pour ce message (affichés sous la bulle, persistés en base). */
+  mentionedDocs?: { id: string; title: string }[];
+  /** Stats renvoyées en fin de stream (persistées pour les messages assistant). */
+  replyMeta?: MessageMeta;
+  /** 1 = pouce bas, 2 = pouce haut — persisté après envoi du feedback. */
+  rating?: 1 | 2;
+  ratingSent?: boolean;
+}
+
+function mentionedDocsFromRowMetadata(meta: unknown): { id: string; title: string }[] | undefined {
+  if (!meta || typeof meta !== "object") return undefined;
+  const raw = (meta as { mentioned_docs?: unknown }).mentioned_docs;
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const out: { id: string; title: string }[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const id = (item as { id?: unknown }).id;
+    const title = (item as { title?: unknown }).title;
+    if (typeof id === "string" && typeof title === "string") out.push({ id, title });
+  }
+  return out.length ? out : undefined;
+}
+
 interface Conversation {
   id: string;
   title: string;
@@ -84,11 +125,22 @@ interface Conversation {
 
 type LicenseKind = "proprietary" | "open_weights" | "unknown";
 
+/** OpenRouter renvoie parfois un nombre, parfois un objet imbriqué. */
+function openRouterContextLengthTokens(m: OpenRouterModel | undefined): number | null {
+  const raw = m?.context_length as unknown;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return raw;
+  if (raw && typeof raw === "object" && "context_length" in raw) {
+    const inner = (raw as { context_length?: unknown }).context_length;
+    if (typeof inner === "number" && Number.isFinite(inner) && inner > 0) return inner;
+  }
+  return null;
+}
+
 interface OpenRouterModel {
   id: string;
   name: string;
   description?: string;
-  context_length: number;
+  context_length?: number | unknown;
   license_kind?: LicenseKind;
   pricing_per_1m_usd?: {
     input?: number | null;
@@ -116,9 +168,42 @@ const getChatUrl = () => `${getApiBaseUrl()}/chat`;
 
 const TELKO_OPENWEBUI_MODEL_ID = "telko/openwebui";
 
+/** Aligné sur le défaut backend si OpenRouter ne fournit pas `context_length`. */
+const DEFAULT_MODEL_CONTEXT_TOKENS = 128_000;
+const CHARS_PER_TOKEN_EST = 2;
+const SAFETY_MARGIN_TOKENS = 2048;
+
+function completionReserveTokens(ctx: number): number {
+  return Math.min(16384, Math.max(4096, Math.floor(ctx / 8)));
+}
+
+function roughTokensFromChars(charCount: number): number {
+  return Math.max(0, Math.ceil(charCount / CHARS_PER_TOKEN_EST));
+}
+
+/** Budget caractères pour le corps documentaire (hors instructions système côté serveur / hors reste du prompt ici). */
+function mentionDocCharBudget(modelContextTokens: number, nonDocumentPromptChars: number): number {
+  const ctx = Math.min(Math.max(modelContextTokens, 8192), 2_000_000);
+  const promptTokenBudget = ctx - completionReserveTokens(ctx) - SAFETY_MARGIN_TOKENS;
+  const fixedTokens = roughTokensFromChars(nonDocumentPromptChars);
+  const mentionTokenBudget = Math.max(0, promptTokenBudget - fixedTokens);
+  return Math.max(0, Math.floor(mentionTokenBudget * CHARS_PER_TOKEN_EST));
+}
+
+function truncateDocContextToMax(ctx: string, maxChars: number): string {
+  if (ctx.length <= maxChars) return ctx;
+  const note =
+    "[Extrait tronqué : le document dépasse la taille maximale pour ce mode (fenêtre du modèle). Le modèle ne verra qu’un fragment.]\n\n";
+  const bodyCap = Math.max(0, maxChars - note.length);
+  return note + ctx.slice(0, bodyCap);
+}
+
 function chatProviderForModel(modelId: string): string {
   return modelId === TELKO_OPENWEBUI_MODEL_ID ? "openwebui" : "openrouter";
 }
+
+/** Modèle chat par défaut (première visite, échec chargement liste, cohérent avec OPENROUTER_LLM_MODEL côté backend). */
+const DEFAULT_ASSISTANT_OPENROUTER_MODEL = "openai/gpt-4o-mini";
 
 /** Dernier modèle OpenRouter choisi ou ayant servi à une réponse réussie (préféré au default API). */
 const LAST_OPENROUTER_MODEL_KEY = "telko_last_openrouter_model";
@@ -144,14 +229,14 @@ function resolveOpenRouterModelSelection(models: OpenRouterModel[], apiDefault?:
   const saved = readPersistedOpenRouterModel();
   if (saved && (ids.has(saved) || saved === "openrouter/auto")) return saved;
   if (apiDefault) return apiDefault;
-  return "openrouter/auto";
+  return DEFAULT_ASSISTANT_OPENROUTER_MODEL;
 }
 
 export default function Assistant() {
   const { user, profile, role } = useAuth();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
-  const [selectedModel, setSelectedModel] = useState<string>("openrouter/auto");
+  const [selectedModel, setSelectedModel] = useState<string>(DEFAULT_ASSISTANT_OPENROUTER_MODEL);
   const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
   const [availableModels, setAvailableModels] = useState<OpenRouterModel[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -161,15 +246,12 @@ export default function Assistant() {
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionedDocs, setMentionedDocs] = useState<Doc[]>([]);
   const [docCount, setDocCount] = useState(0);
-  /** 1 = pouce bas, 2 = pouce haut (aligné sur l’API). */
-  const [ratings, setRatings] = useState<Record<number, 1 | 2>>({});
-  const [ratingsSent, setRatingsSent] = useState<Record<number, boolean>>({});
   const [responseTimeMs, setResponseTimeMs] = useState<number>(0);
   const [sendTime, setSendTime] = useState<number>(0);
-  const [messageMetas, setMessageMetas] = useState<Record<number, MessageMeta | undefined>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const navigate = useNavigate();
   const [gameQuestions, setGameQuestions] = useState<AssistantGameQuestion[]>([]);
 
   const applyGameQuestion = useCallback((text: string) => {
@@ -232,7 +314,7 @@ export default function Assistant() {
         setSelectedModel(resolveOpenRouterModelSelection(list, data.default_model));
       })
       .catch(() => {
-        // En cas d'erreur on garde le modèle par défaut "openrouter/auto"
+        setSelectedModel(resolveOpenRouterModelSelection([], undefined));
       });
   }, []);
 
@@ -244,18 +326,28 @@ export default function Assistant() {
       .single();
     if (!data?.file_path) return;
 
-    const { data: blob, error } = await supabase.storage
-      .from("knowledge-files")
-      .download(data.file_path);
-    if (error || !blob) {
-      toast({ title: "Erreur", description: "Impossible de prévisualiser ce PDF.", variant: "destructive" });
+    const baseName = data.file_path.split("/").pop() || data.title;
+    const kind = getKnowledgeFileKind(baseName);
+
+    if (kind === "pdf") {
+      const { data: blob, error } = await supabase.storage
+        .from("knowledge-files")
+        .download(data.file_path);
+      if (error || !blob) {
+        toast({
+          title: "Erreur",
+          description: "Impossible de prévisualiser ce document.",
+          variant: "destructive",
+        });
+        return;
+      }
+      const blobUrl = URL.createObjectURL(blob);
+      window.open(blobUrl, "_blank", "noopener,noreferrer");
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
       return;
     }
 
-    const blobUrl = URL.createObjectURL(blob);
-    // Ouverture en prévisualisation dans un nouvel onglet (sans téléchargement forcé)
-    window.open(blobUrl, "_blank", "noopener,noreferrer");
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    navigate(`/knowledge-base?doc=${docId}`);
   };
 
   
@@ -270,10 +362,34 @@ export default function Assistant() {
   const loadMessages = useCallback(async (convId: string) => {
     const { data } = await supabase
       .from("chat_messages")
-      .select("role, content")
+      .select("id, role, content, metadata")
       .eq("conversation_id", convId)
       .order("created_at", { ascending: true });
-    setMessages((data as Msg[]) ?? []);
+    const rows = (data ?? []) as {
+      id: string;
+      role: string;
+      content: string;
+      metadata?: unknown;
+    }[];
+    setMessages(
+      rows.map((row) => {
+        const msg: Msg = {
+          id: row.id,
+          role: row.role as "user" | "assistant",
+          content: row.content,
+        };
+        if (row.role === "user") {
+          const mentionedDocs = mentionedDocsFromRowMetadata(row.metadata);
+          if (mentionedDocs) msg.mentionedDocs = mentionedDocs;
+        } else {
+          const { replyMeta, rating, ratingSent } = assistantExtrasFromMetadata(row.metadata);
+          if (replyMeta) msg.replyMeta = replyMeta;
+          if (rating != null) msg.rating = rating;
+          if (ratingSent) msg.ratingSent = ratingSent;
+        }
+        return msg;
+      }),
+    );
   }, []);
 
   const loadConversations = useCallback(async () => {
@@ -298,69 +414,6 @@ export default function Assistant() {
     }
   }, [loadMessages]);
 
-  // Persistance locale des métadonnées de messages et des notations par conversation
-  useEffect(() => {
-    if (!activeConvId) return;
-    const metasRaw = window.localStorage.getItem(`telko_message_metas_${activeConvId}`);
-    const ratingsRaw = window.localStorage.getItem(`telko_thumbs_${activeConvId}`);
-    const ratingsSentRaw = window.localStorage.getItem(`telko_thumbs_sent_${activeConvId}`);
-    if (metasRaw) {
-      try {
-        setMessageMetas(JSON.parse(metasRaw));
-      } catch {
-        // ignore JSON invalide
-      }
-    } else {
-      setMessageMetas({});
-    }
-    if (ratingsRaw) {
-      try {
-        const parsed = JSON.parse(ratingsRaw) as Record<string, number>;
-        const next: Record<number, 1 | 2> = {};
-        for (const [k, v] of Object.entries(parsed)) {
-          const idx = Number(k);
-          if (!Number.isFinite(idx)) continue;
-          if (v === 1 || v === 2) next[idx] = v;
-        }
-        setRatings(next);
-      } catch {
-        setRatings({});
-      }
-    } else {
-      setRatings({});
-    }
-    if (ratingsSentRaw) {
-      try {
-        setRatingsSent(JSON.parse(ratingsSentRaw));
-      } catch {
-        setRatingsSent({});
-      }
-    } else {
-      setRatingsSent({});
-    }
-  }, [activeConvId]);
-
-  useEffect(() => {
-    if (!activeConvId) return;
-    window.localStorage.setItem(
-      `telko_message_metas_${activeConvId}`,
-      JSON.stringify(messageMetas),
-    );
-  }, [activeConvId, messageMetas]);
-
-  useEffect(() => {
-    if (!activeConvId) return;
-    window.localStorage.setItem(`telko_thumbs_${activeConvId}`, JSON.stringify(ratings));
-  }, [activeConvId, ratings]);
-
-  useEffect(() => {
-    if (!activeConvId) return;
-    window.localStorage.setItem(
-      `telko_thumbs_sent_${activeConvId}`,
-      JSON.stringify(ratingsSent),
-    );
-  }, [activeConvId, ratingsSent]);
-
   const selectConversation = (convId: string) => {
     setActiveConvId(convId);
     window.localStorage.setItem("telko_active_conversation_id", convId);
@@ -368,36 +421,18 @@ export default function Assistant() {
   };
 
   const startNewConversation = () => {
-    if (activeConvId) {
-      window.localStorage.removeItem(`telko_message_metas_${activeConvId}`);
-      window.localStorage.removeItem(`telko_thumbs_${activeConvId}`);
-      window.localStorage.removeItem(`telko_thumbs_sent_${activeConvId}`);
-      window.localStorage.removeItem(`telko_ratings_${activeConvId}`);
-      window.localStorage.removeItem(`telko_ratings_sent_${activeConvId}`);
-    }
     setActiveConvId(null);
     window.localStorage.removeItem("telko_active_conversation_id");
     setMessages([]);
     setMentionedDocs([]);
-    setMessageMetas({});
-    setRatings({});
-    setRatingsSent({});
   };
 
   const deleteConversation = async (convId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     await supabase.from("conversations").delete().eq("id", convId);
     if (activeConvId === convId) {
-      window.localStorage.removeItem(`telko_message_metas_${convId}`);
-      window.localStorage.removeItem(`telko_thumbs_${convId}`);
-      window.localStorage.removeItem(`telko_thumbs_sent_${convId}`);
-      window.localStorage.removeItem(`telko_ratings_${convId}`);
-      window.localStorage.removeItem(`telko_ratings_sent_${convId}`);
       setActiveConvId(null);
       setMessages([]);
-      setMessageMetas({});
-      setRatings({});
-      setRatingsSent({});
     }
     loadConversations();
   };
@@ -434,12 +469,29 @@ export default function Assistant() {
     setMentionedDocs((prev) => prev.filter((d) => d.id !== docId));
   };
 
-  const saveMessage = async (convId: string, msg: Msg) => {
-    await supabase.from("chat_messages").insert({
-      conversation_id: convId,
-      role: msg.role,
-      content: msg.content,
-    });
+  const saveMessage = async (convId: string, msg: Msg): Promise<string | null> => {
+    const metadata: Record<string, unknown> = {};
+    if (msg.role === "user" && msg.mentionedDocs?.length) {
+      metadata.mentioned_docs = msg.mentionedDocs;
+    }
+    if (msg.role === "assistant" && msg.replyMeta) {
+      metadata.response_meta = msg.replyMeta;
+    }
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .insert({
+        conversation_id: convId,
+        role: msg.role,
+        content: msg.content,
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      })
+      .select("id")
+      .single();
+    if (error) {
+      console.error(error);
+      return null;
+    }
+    return data?.id ?? null;
   };
 
   const handleSend = async (overrideText?: string) => {
@@ -448,9 +500,15 @@ export default function Assistant() {
 
     setIsLoading(true);
 
+    const modelMeta = availableModels.find((m) => m.id === selectedModel);
+    const modelContextTokens =
+      openRouterContextLengthTokens(modelMeta) ?? DEFAULT_MODEL_CONTEXT_TOKENS;
+
+    const useQdrantForMentions = mentionedDocs.length > 0 && selectedModel !== TELKO_OPENWEBUI_MODEL_ID;
+
     let hydratedMentionedDocs = mentionedDocs;
 
-    if (mentionedDocs.length > 0) {
+    if (mentionedDocs.length > 0 && !useQdrantForMentions) {
       hydratedMentionedDocs = await Promise.all(
         mentionedDocs.map(async (doc) => {
           if (!isPdfPlaceholderContent(doc.content) || !doc.file_path) return doc;
@@ -462,9 +520,21 @@ export default function Assistant() {
 
             if (error || !blob) return doc;
 
-            const extractedContent = await extractPdfText(blob);
-            if (!extractedContent.trim()) return doc;
+            const baseName = doc.file_path.split("/").pop() || "fichier";
+            const kind = getKnowledgeFileKind(baseName);
 
+            if (kind === "pdf") {
+              const extractedContent = await extractPdfText(blob);
+              if (!extractedContent.trim()) return doc;
+              return { ...doc, content: extractedContent };
+            }
+
+            const { data: sess } = await supabase.auth.getSession();
+            const token = sess.session?.access_token;
+            if (!token) return doc;
+
+            const extractedContent = await extractDocumentTextViaApi(blob, baseName, token);
+            if (!extractedContent.trim()) return doc;
             return { ...doc, content: extractedContent };
           } catch {
             return doc;
@@ -478,9 +548,9 @@ export default function Assistant() {
 
       if (unresolvedDocs.length > 0) {
         toast({
-          title: "Extraction PDF incomplète",
+          title: "Extraction du document incomplète",
           description:
-            "Impossible de lire le texte du PDF mentionné. Réuploadez le fichier depuis la Base documentaire pour l’indexer correctement.",
+            "Impossible de lire le texte du fichier mentionné. Réuploadez-le depuis la Base documentaire ou vérifiez que le backend peut extraire ce format.",
           variant: "destructive",
         });
         setIsLoading(false);
@@ -489,13 +559,32 @@ export default function Assistant() {
     }
 
     let docContext = "";
+    let mentionedSourceIds: string[] | undefined;
+
     if (hydratedMentionedDocs.length > 0) {
-      docContext = hydratedMentionedDocs
-        .map((d) => `[Document: ${d.title}]\n${d.content}`)
-        .join("\n\n");
+      if (useQdrantForMentions) {
+        mentionedSourceIds = hydratedMentionedDocs.map((d) => `supabase:${d.id}`);
+      } else {
+        const rawDoc = hydratedMentionedDocs
+          .map((d) => `[Document: ${d.title}]\n${d.content}`)
+          .join("\n\n");
+        const nonDocPromptChars =
+          messages.reduce((acc, m) => acc + m.content.length, 0) +
+          `[Documents référencés]\n\n[Question]\n${text}`.length;
+        const maxDocChars = mentionDocCharBudget(modelContextTokens, nonDocPromptChars);
+        docContext = truncateDocContextToMax(rawDoc, maxDocChars);
+      }
     }
 
-    const userMsg: Msg = { role: "user", content: text };
+    const userMsg: Msg = {
+      role: "user",
+      content: text,
+      ...(hydratedMentionedDocs.length > 0
+        ? {
+            mentionedDocs: hydratedMentionedDocs.map((d) => ({ id: d.id, title: d.title })),
+          }
+        : {}),
+    };
     const updatedMessages = [...messages, userMsg];
     setMessages(updatedMessages);
     setInput("");
@@ -523,9 +612,19 @@ export default function Assistant() {
       await supabase.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", convId);
     }
 
-    await saveMessage(convId, userMsg);
+    const userRowId = await saveMessage(convId, userMsg);
+    if (userRowId) {
+      setMessages((prev) => {
+        const last = prev.length - 1;
+        if (last < 0 || prev[last].role !== "user") return prev;
+        const next = [...prev];
+        next[last] = { ...next[last], id: userRowId };
+        return next;
+      });
+    }
 
     let assistantSoFar = "";
+    let finalAssistantMeta: MessageMeta | undefined;
 
     const apiMessages = updatedMessages.map((m) => ({ role: m.role, content: m.content }));
     if (docContext) {
@@ -552,6 +651,8 @@ export default function Assistant() {
           department: profile?.department,
           provider: chatProviderForModel(selectedModel),
           model: selectedModel,
+          model_context_tokens: modelContextTokens,
+          ...(mentionedSourceIds?.length ? { mentioned_source_ids: mentionedSourceIds } : {}),
         }),
       });
 
@@ -594,16 +695,15 @@ export default function Assistant() {
             const parsed = JSON.parse(jsonStr);
             // Event "meta" envoyé en fin de stream avec les stats détaillées
             if (parsed.meta) {
-              setResponseTimeMs(parsed.meta?.timing?.response_time_ms ?? Date.now() - sendTime);
-              // On attache toujours les métadonnées au DERNIER message de la liste,
-              // qui est l'assistant en cours de génération.
+              const meta = parsed.meta as MessageMeta;
+              finalAssistantMeta = meta;
+              setResponseTimeMs(meta?.timing?.response_time_ms ?? Date.now() - sendTime);
               setMessages((prev) => {
-                const lastIndex = Math.max(0, prev.length - 1);
-                setMessageMetas((prevMeta) => ({
-                  ...prevMeta,
-                  [lastIndex]: parsed.meta as MessageMeta,
-                }));
-                return prev;
+                const last = prev.length - 1;
+                if (last < 0 || prev[last].role !== "assistant") return prev;
+                const next = [...prev];
+                next[last] = { ...next[last], replyMeta: meta };
+                return next;
               });
               continue;
             }
@@ -629,7 +729,21 @@ export default function Assistant() {
       }
 
       if (assistantSoFar && convId) {
-        await saveMessage(convId, { role: "assistant", content: assistantSoFar });
+        const assistantPayload: Msg = {
+          role: "assistant",
+          content: assistantSoFar,
+          ...(finalAssistantMeta ? { replyMeta: finalAssistantMeta } : {}),
+        };
+        const assistantRowId = await saveMessage(convId, assistantPayload);
+        if (assistantRowId) {
+          setMessages((prev) => {
+            const last = prev.length - 1;
+            if (last < 0 || prev[last].role !== "assistant") return prev;
+            const next = [...prev];
+            next[last] = { ...next[last], id: assistantRowId };
+            return next;
+          });
+        }
       }
       persistOpenRouterModel(modelUsedForRequest);
     } catch (e) {
@@ -641,10 +755,15 @@ export default function Assistant() {
     loadConversations();
   };
 
-  const handleRating = async (messageIndex: number, rating: 1 | 2, response: string) => {
-    setRatings((prev) => ({ ...prev, [messageIndex]: rating }));
-
+  const handleRating = async (
+    messageIndex: number,
+    rating: 1 | 2,
+    response: string,
+    assistantMsg: Msg,
+  ) => {
     const userMessage = messages[messageIndex - 1]?.content ?? "";
+    const responseTimeForFeedback =
+      assistantMsg.replyMeta?.timing?.response_time_ms ?? responseTimeMs;
 
     try {
       await fetch(`${getApiBaseUrl()}/api/feedback/`, {
@@ -656,11 +775,28 @@ export default function Assistant() {
           prompt: userMessage,
           response,
           rating,
-          response_time_ms: responseTimeMs,
+          response_time_ms: responseTimeForFeedback,
           conversation_id: activeConvId ?? undefined,
         }),
       });
-      setRatingsSent((prev) => ({ ...prev, [messageIndex]: true }));
+      if (assistantMsg.id) {
+        const { data: row } = await supabase
+          .from("chat_messages")
+          .select("metadata")
+          .eq("id", assistantMsg.id)
+          .single();
+        const base =
+          row?.metadata != null && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+            ? { ...(row.metadata as Record<string, unknown>) }
+            : {};
+        await supabase
+          .from("chat_messages")
+          .update({ metadata: { ...base, rating, rating_sent: true } })
+          .eq("id", assistantMsg.id);
+      }
+      setMessages((prev) =>
+        prev.map((m, i) => (i === messageIndex ? { ...m, rating, ratingSent: true } : m)),
+      );
     } catch (err) {
       console.error("Erreur envoi feedback:", err);
     }
@@ -798,8 +934,13 @@ export default function Assistant() {
                   )}
                 </div>
               )}
-              {messages.map((msg, i) => (
-                <div key={i} className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}>
+              {messages.map((msg, i) => {
+                const streamingAssistantFooter =
+                  isLoading && i === messages.length - 1 && msg.role === "assistant";
+                const showAssistantFooter =
+                  msg.role === "assistant" && msg.replyMeta && !streamingAssistantFooter;
+                return (
+                <div key={msg.id ?? `m-${i}`} className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}>
                   <div
                     className={`rounded-lg px-3 py-2 max-w-[75%] text-sm ${
                       msg.role === "user" ? "bg-primary text-primary-foreground" : "bg-muted text-foreground"
@@ -842,13 +983,37 @@ export default function Assistant() {
                       msg.content
                     )}
                   </div>
-                  {msg.role === "assistant" && (
+                  {msg.role === "user" && msg.mentionedDocs && msg.mentionedDocs.length > 0 && (
+                    <div className="mt-1 max-w-[75%] text-right">
+                      <div className="inline-flex flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-[10px] leading-tight text-muted-foreground">
+                        {msg.mentionedDocs.map((d) => (
+                          <button
+                            key={d.id}
+                            type="button"
+                            onClick={() => void openDocById(d.id)}
+                            className="inline-flex max-w-full items-center gap-0.5 rounded-sm px-0.5 text-left transition-colors hover:text-foreground hover:underline underline-offset-2"
+                            title={d.title}
+                          >
+                            <FileText className="h-2.5 w-2.5 shrink-0 opacity-80" aria-hidden />
+                            <span className="truncate max-w-[14rem]">@{d.title}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {showAssistantFooter && msg.replyMeta && (
                     <div className="flex flex-col items-start gap-1 mt-1 text-xs">
                       {(() => {
-                        const meta = messageMetas[i];
-                        if (!meta) return null;
+                        const meta = msg.replyMeta;
                         const t = meta.timing;
-                        const u = meta.usage as any | undefined;
+                        const u = meta.usage as
+                          | {
+                              llm?: { total_tokens?: number };
+                              embeddings?: { total_tokens?: number };
+                              cost?: { total_usd?: number };
+                              raw?: { total_tokens?: number; cost?: number };
+                            }
+                          | undefined;
                         const llmTokensTotal =
                           u?.llm?.total_tokens != null
                             ? u.llm.total_tokens
@@ -865,6 +1030,7 @@ export default function Assistant() {
                           u?.cost?.total_usd != null
                             ? u.cost.total_usd
                             : u?.raw?.cost;
+                        const totalMs = t?.response_time_ms ?? 0;
                         return (
                           <div className="flex flex-col gap-1 px-3 py-2 rounded-lg bg-muted/70 text-muted-foreground border border-border/60 max-w-[420px]">
                             <div className="flex items-center justify-between gap-2">
@@ -887,8 +1053,8 @@ export default function Assistant() {
                               <div>
                                 <div className="text-muted-foreground/80">Temps total</div>
                                 <div className="font-mono">
-                                  {(t?.response_time_ms ?? responseTimeMs) > 0
-                                    ? `~${(t?.response_time_ms ?? responseTimeMs).toLocaleString("fr-FR")} ms`
+                                  {totalMs > 0
+                                    ? `~${totalMs.toLocaleString("fr-FR")} ms`
                                     : "—"}
                                 </div>
                               </div>
@@ -912,91 +1078,90 @@ export default function Assistant() {
                           </div>
                         );
                       })()}
-                      {messageMetas[i] && (
-                        <div className="mt-1 max-w-[min(100%,420px)] rounded-lg border border-emerald-400/35 bg-gradient-to-r from-emerald-500/[0.14] via-sky-400/[0.1] to-rose-500/[0.14] px-2.5 py-2 shadow-sm ring-1 ring-inset ring-white/40 dark:border-emerald-500/25 dark:from-emerald-500/20 dark:via-sky-500/15 dark:to-rose-500/20 dark:ring-white/10">
-                          {ratingsSent[i] ? (
+                      <div className="mt-1 max-w-[min(100%,420px)] rounded-lg border border-emerald-400/35 bg-gradient-to-r from-emerald-500/[0.14] via-sky-400/[0.1] to-rose-500/[0.14] px-2.5 py-2 shadow-sm ring-1 ring-inset ring-white/40 dark:border-emerald-500/25 dark:from-emerald-500/20 dark:via-sky-500/15 dark:to-rose-500/20 dark:ring-white/10">
+                        {msg.ratingSent ? (
+                          <div
+                            className={cn(
+                              "flex items-center gap-2.5 text-xs font-medium leading-snug",
+                              msg.rating === 2
+                                ? "text-emerald-800 dark:text-emerald-300"
+                                : "text-rose-800 dark:text-rose-300",
+                            )}
+                          >
+                            {msg.rating === 2 ? (
+                              <ThumbsUp
+                                className="h-8 w-8 shrink-0 fill-emerald-500 stroke-emerald-800 drop-shadow-sm dark:fill-emerald-400 dark:stroke-emerald-100"
+                                strokeWidth={1.5}
+                              />
+                            ) : (
+                              <ThumbsDown
+                                className="h-8 w-8 shrink-0 fill-rose-500 stroke-rose-900 drop-shadow-sm dark:fill-rose-400 dark:stroke-rose-100"
+                                strokeWidth={1.5}
+                              />
+                            )}
+                            <span>Merci pour votre retour</span>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                            <p className="text-xs font-medium leading-snug text-sky-900 dark:text-sky-200">
+                              Cette réponse vous a-t-elle aidé ?
+                            </p>
                             <div
-                              className={cn(
-                                "flex items-center gap-2.5 text-xs font-medium leading-snug",
-                                ratings[i] === 2
-                                  ? "text-emerald-800 dark:text-emerald-300"
-                                  : "text-rose-800 dark:text-rose-300",
-                              )}
+                              className="flex items-center gap-4"
+                              role="group"
+                              aria-label="Évaluation de la réponse"
                             >
-                              {ratings[i] === 2 ? (
-                                <ThumbsUp
-                                  className="h-8 w-8 shrink-0 fill-emerald-500 stroke-emerald-800 drop-shadow-sm dark:fill-emerald-400 dark:stroke-emerald-100"
-                                  strokeWidth={1.5}
-                                />
-                              ) : (
-                                <ThumbsDown
-                                  className="h-8 w-8 shrink-0 fill-rose-500 stroke-rose-900 drop-shadow-sm dark:fill-rose-400 dark:stroke-rose-100"
-                                  strokeWidth={1.5}
-                                />
-                              )}
-                              <span>Merci pour votre retour</span>
-                            </div>
-                          ) : (
-                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-                              <p className="text-xs font-medium leading-snug text-sky-900 dark:text-sky-200">
-                                Cette réponse vous a-t-elle aidé ?
-                              </p>
-                              <div
-                                className="flex items-center gap-4"
-                                role="group"
-                                aria-label="Évaluation de la réponse"
+                              <button
+                                type="button"
+                                onClick={() => handleRating(i, 2, msg.content, msg)}
+                                className={cn(
+                                  "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
+                                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                                  "active:scale-90",
+                                )}
+                                aria-label="Pouce haut — utile"
+                                aria-pressed={msg.rating === 2}
                               >
-                                <button
-                                  type="button"
-                                  onClick={() => handleRating(i, 2, msg.content)}
+                                <ThumbsUp
                                   className={cn(
-                                    "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
-                                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-                                    "active:scale-90",
+                                    "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
+                                    msg.rating === 2
+                                      ? "fill-emerald-500 stroke-emerald-800 dark:fill-emerald-400 dark:stroke-emerald-100"
+                                      : "fill-none stroke-emerald-600 hover:stroke-emerald-700 hover:drop-shadow-md dark:stroke-emerald-400/90 dark:hover:stroke-emerald-300",
                                   )}
-                                  aria-label="Pouce haut — utile"
-                                  aria-pressed={ratings[i] === 2}
-                                >
-                                  <ThumbsUp
-                                    className={cn(
-                                      "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
-                                      ratings[i] === 2
-                                        ? "fill-emerald-500 stroke-emerald-800 dark:fill-emerald-400 dark:stroke-emerald-100"
-                                        : "fill-none stroke-emerald-600 hover:stroke-emerald-700 hover:drop-shadow-md dark:stroke-emerald-400/90 dark:hover:stroke-emerald-300",
-                                    )}
-                                    strokeWidth={ratings[i] === 2 ? 1.5 : 2.25}
-                                  />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleRating(i, 1, msg.content)}
+                                  strokeWidth={msg.rating === 2 ? 1.5 : 2.25}
+                                />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRating(i, 1, msg.content, msg)}
+                                className={cn(
+                                  "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
+                                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                                  "active:scale-90",
+                                )}
+                                aria-label="Pouce bas — pas utile"
+                                aria-pressed={msg.rating === 1}
+                              >
+                                <ThumbsDown
                                   className={cn(
-                                    "-m-0.5 rounded-md p-0.5 transition-transform duration-150",
-                                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-                                    "active:scale-90",
+                                    "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
+                                    msg.rating === 1
+                                      ? "fill-rose-500 stroke-rose-900 dark:fill-rose-400 dark:stroke-rose-100"
+                                      : "fill-none stroke-rose-600 hover:stroke-rose-700 hover:drop-shadow-md dark:stroke-rose-400/90 dark:hover:stroke-rose-300",
                                   )}
-                                  aria-label="Pouce bas — pas utile"
-                                  aria-pressed={ratings[i] === 1}
-                                >
-                                  <ThumbsDown
-                                    className={cn(
-                                      "h-8 w-8 shrink-0 transition-colors duration-150 drop-shadow-sm",
-                                      ratings[i] === 1
-                                        ? "fill-rose-500 stroke-rose-900 dark:fill-rose-400 dark:stroke-rose-100"
-                                        : "fill-none stroke-rose-600 hover:stroke-rose-700 hover:drop-shadow-md dark:stroke-rose-400/90 dark:hover:stroke-rose-300",
-                                    )}
-                                    strokeWidth={ratings[i] === 1 ? 1.5 : 2.25}
-                                  />
-                                </button>
-                              </div>
+                                  strokeWidth={msg.rating === 1 ? 1.5 : 2.25}
+                                />
+                              </button>
                             </div>
-                          )}
-                        </div>
-                      )}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
               {isLoading && messages[messages.length - 1]?.role !== "assistant" && (
                 <div className="flex justify-start">
                   <div className="bg-muted rounded-lg px-3 py-2 text-sm flex items-center gap-2">
@@ -1107,7 +1272,13 @@ export default function Assistant() {
               {mentionedDocs.length > 0 && (
                 <div className="flex gap-2 flex-wrap">
                   {mentionedDocs.map((doc) => (
-                    <MentionedDocBadge key={doc.id} title={doc.title} content={doc.content} onRemove={() => removeMentionedDoc(doc.id)} />
+                    <MentionedDocBadge
+                      key={doc.id}
+                      title={doc.title}
+                      content={doc.content}
+                      filePath={doc.file_path}
+                      onRemove={() => removeMentionedDoc(doc.id)}
+                    />
                   ))}
                 </div>
               )}

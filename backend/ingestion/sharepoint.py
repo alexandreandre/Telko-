@@ -39,7 +39,17 @@ _DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=5.0)
 
 # Extensions de fichiers considérées comme "documents" (filtre côté list)
 _DOCUMENT_EXTENSIONS = {
-    ".pdf", ".docx", ".pptx", ".txt", ".xlsx", ".jpg", ".jpeg", ".png",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".xls",
+    ".xlsx",
+    ".jpg",
+    ".jpeg",
+    ".png",
 }
 
 

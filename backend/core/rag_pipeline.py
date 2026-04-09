@@ -20,6 +20,92 @@ logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_TURNS = 10  # Nombre maximum de tours (question+réponse) conservés par conversation
 
+# Fenêtre de contexte si le client ne fournit pas `model_context_tokens` (OpenRouter / défaut courant).
+_DEFAULT_MODEL_CONTEXT_TOKENS = 128_000
+# Estimation prudente pour texte FR / technique (souvent ~2 caractères par token côté Azure / cl100k).
+_CHARS_PER_TOKEN_ESTIMATE = 2.0
+_CONTEXT_SAFETY_MARGIN_TOKENS = 2_048
+
+_DOC_SECTION_PREFIX = "\n\n=== DOCUMENTS PERTINENTS (base documentaire Telko) ===\n"
+_MENTION_TRUNCATION_NOTE = (
+    "[Note : seule une partie du document a été transmise au modèle (limite de contexte). "
+    "Le résumé ou l’analyse peuvent être incomplets.]\n\n"
+)
+
+
+def _rough_tokens_from_chars(char_count: int) -> int:
+    return max(0, int(char_count / _CHARS_PER_TOKEN_ESTIMATE))
+
+
+def _completion_reserve_tokens(model_ctx: int) -> int:
+    """Réserve une partie de la fenêtre pour la génération (les API comptent souvent prompt + sortie)."""
+    return min(16_384, max(4_096, model_ctx // 8))
+
+
+def _format_markdown_instructions_block(role_name: str, department: str) -> str:
+    """Bloc d’instructions Markdown + profil (sans section documents)."""
+    return (
+        "Mise en forme attendue (Markdown) :\n"
+        "- Utilise des titres de niveau 2 (`##`) pour structurer ta réponse (par exemple `## Résumé`, `## Détails`, `## Actions recommandées`).\n"
+        "- Utilise des listes à puces pour énumérer des points.\n"
+        "- Mets en **gras** les éléments importants (décisions, chiffres clés, avertissements).\n"
+        "- Sois clair, concis et évite les phrases trop longues.\n\n"
+        "Gestion des sources :\n"
+        "- Quand tu t'appuies sur un document, mentionne-le dans le texte sous la forme `[nom_du_fichier – page X]` lorsque la page est connue.\n"
+        "- À la toute fin de ta réponse, ajoute OBLIGATOIREMENT une section `## Sources`.\n"
+        "- Dans `## Sources`, liste uniquement les documents réellement utilisés pour répondre, sous forme de liens Markdown cliquables :\n"
+        "  - `- [nom_du_fichier – page X](#)` si tu ne connais pas l'URL exacte,\n"
+        "  - ou `- [nom_du_fichier – page X](URL_COMPLÈTE)` si l'URL est présente dans le texte du contexte.\n\n"
+        f"L'utilisateur est {role_name or 'un collaborateur'} dans le département {department or 'non précisé'}."
+    )
+
+
+def _telko_rag_system_lead() -> str:
+    return (
+        "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
+        "Réponds UNIQUEMENT à partir des documents fournis ci‑dessous. "
+        "Si une information n'est pas explicitement présente dans les documents, dis-le clairement et explique ce qu'il manque.\n\n"
+    )
+
+
+def _mention_context_char_cap(
+    *,
+    model_context_tokens: int,
+    role_name: str,
+    department: str,
+    message: str,
+    history: list[tuple[str, str]],
+) -> int:
+    """
+    Nombre maximal de caractères pour le corps du contexte documentaire @mention,
+    d’après la fenêtre du modèle et une estimation prudente des tokens (prompt hors document).
+    """
+    ctx = min(max(model_context_tokens, 8_192), 2_000_000)
+    reserve_out = _completion_reserve_tokens(ctx)
+    prompt_token_budget = ctx - reserve_out - _CONTEXT_SAFETY_MARGIN_TOKENS
+    if prompt_token_budget < 1024:
+        prompt_token_budget = 1024
+
+    skeleton = (
+        _telko_rag_system_lead()
+        + _format_markdown_instructions_block(role_name, department)
+        + _DOC_SECTION_PREFIX
+    )
+    hist_chars = sum(len(h) + len(a) for h, a in history[-_MAX_HISTORY_TURNS :])
+    fixed_tokens = _rough_tokens_from_chars(len(skeleton) + len(message) + hist_chars)
+
+    mention_token_budget = prompt_token_budget - fixed_tokens
+    char_cap = int(mention_token_budget * _CHARS_PER_TOKEN_ESTIMATE)
+    cap = max(0, char_cap)
+    logger.info(
+        "Budget contexte @mention : model_ctx=%d, reserve_sortie=%d, cap_chars=%d (estimation %.1f car./token).",
+        ctx,
+        reserve_out,
+        cap,
+        _CHARS_PER_TOKEN_ESTIMATE,
+    )
+    return cap
+
 
 # ---------------------------------------------------------------------------
 # Types
@@ -43,6 +129,57 @@ def _format_context(docs: list[Document]) -> str:
         header = f"[{filename}" + (f", page {page}]" if page else "]")
         parts.append(f"{header}\n{doc.page_content}")
     return "\n\n".join(parts)
+
+
+def _format_mention_context(docs: list[Document]) -> str:
+    """
+    Contexte @mention : un seul titre par fichier, puis les corps de chunks concaténés.
+    Évite un en-tête par chunk (512 car.), ce qui explosait le nombre de tokens côté Azure.
+    """
+    if not docs:
+        return ""
+    blocks: list[str] = []
+    current_title: str | None = None
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf, current_title
+        if current_title is None or not buf:
+            return
+        blocks.append(f"### {current_title}\n\n" + "\n\n".join(buf))
+        buf = []
+
+    for d in docs:
+        title = str(d.metadata.get("filename") or d.metadata.get("source") or "Document")
+        body = (d.page_content or "").strip()
+        if not body:
+            continue
+        if title != current_title:
+            flush()
+            current_title = title
+        buf.append(body)
+    flush()
+    return "\n\n---\n\n".join(blocks)
+
+
+def _sort_mention_chunks(docs: list[Document]) -> None:
+    """Ordonne les chunks d’un même document (page puis offset de découpe si présent)."""
+
+    def key(d: Document) -> tuple:
+        m = d.metadata or {}
+        page = m.get("page")
+        try:
+            p = int(page) if page is not None else 0
+        except (TypeError, ValueError):
+            p = 0
+        start = m.get("start_index")
+        try:
+            s = int(start) if start is not None else 0
+        except (TypeError, ValueError):
+            s = 0
+        return (p, s)
+
+    docs.sort(key=key)
 
 
 def _extract_sources(docs: list[Document]) -> list[SourceRef]:  # noqa: F841 — conservé pour usage futur
@@ -158,16 +295,21 @@ class RAGPipeline:
         role_name: str = "",
         department: str = "",
         llm: BaseLLMProvider | None = None,
+        mentioned_source_ids: list[str] | None = None,
+        model_context_tokens: int | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Interroge le pipeline RAG et yield les tokens au fur et à mesure.
 
           1. Récupère l'historique de la conversation
-          2. Recherche sémantique dans Qdrant (k=5)
+          2. Contexte : soit tous les chunks Qdrant pour `mentioned_source_ids` (@mention),
+             soit recherche sémantique (k=5)
           3. Construit les messages au format OpenAI-like avec contexte + historique
           4. Stream via le LLM provider
 
         L'historique est mis à jour après la génération complète.
+
+        `model_context_tokens` : fenêtre du modèle (ex. context_length OpenRouter) pour tronquer le texte @mention.
         """
         history = self._get_history(conversation_id)
 
@@ -185,70 +327,99 @@ class RAGPipeline:
                 conversation_id,
                 (message[:80] + "…") if len(message) > 80 else message,
             )
-            system_lead = (
+            openwebui_lead = (
                 "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
                 "Open WebUI enrichit cette requête avec des extraits issus de la base de connaissances configurée "
                 "sur l’instance (paramètre `files` de l’API). Réponds en t’appuyant sur le contexte que Open WebUI "
                 "injecte ; si l’information n’y figure pas, dis-le clairement.\n\n"
             )
+            system_content = openwebui_lead + _format_markdown_instructions_block(role_name, department)
         else:
-            docs = await self._store.similarity_search(message, k=5)
-            logger.info(
-                "RAGPipeline.stream_query — conv=%s | requête='%s...' | %d document(s) de contexte.",
-                conversation_id,
-                (message[:80] + "…") if len(message) > 80 else message,
-                len(docs),
-            )
-            if not docs:
-                logger.warning(
-                    "RAGPipeline.stream_query — aucun document retourné par Qdrant pour conv=%s. "
-                    "Vérifier l'ingestion (chunks indexés) et la collection '%s'.",
+            embed_usage: dict[str, Any] = {}
+            ids = [s.strip() for s in (mentioned_source_ids or []) if s.strip()]
+            if ids:
+                mention_docs: list[Document] = []
+                for sid in ids:
+                    part = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self._store.fetch_all_by_source,
+                        sid,
+                    )
+                    mention_docs.extend(part)
+                _sort_mention_chunks(mention_docs)
+                if not mention_docs:
+                    yield {
+                        "type": "error",
+                        "content": (
+                            "\n\n⚠️ Ce document n’a pas d’extraits indexés dans la base de recherche. "
+                            "Ouvrez la Base documentaire et vérifiez que le fichier est bien indexé, "
+                            "puis réessayez."
+                        ),
+                    }
+                    return
+                docs = mention_docs
+                logger.info(
+                    "RAGPipeline.stream_query — conv=%s | @mention | %d chunk(s) depuis Qdrant | requête='%s...'.",
                     conversation_id,
-                    self._store._collection if hasattr(self._store, "_collection") else "inconnue",
+                    len(docs),
+                    (message[:80] + "…") if len(message) > 80 else message,
                 )
             else:
-                preview = [
-                    {
-                        "source": d.metadata.get("source"),
-                        "filename": d.metadata.get("filename") or d.metadata.get("source"),
-                        "page": d.metadata.get("page"),
-                    }
-                    for d in docs[:5]
-                ]
-                logger.debug("RAGPipeline.stream_query — premiers documents de contexte: %s", preview)
-            embed_usage = self._store.get_last_embeddings_usage() or {}
-            context = _format_context(docs)
-            system_lead = (
-                "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
-                "Réponds UNIQUEMENT à partir des documents fournis ci‑dessous. "
-                "Si une information n'est pas explicitement présente dans les documents, dis-le clairement et explique ce qu'il manque.\n\n"
-            )
+                docs = await self._store.similarity_search(message, k=5)
+                logger.info(
+                    "RAGPipeline.stream_query — conv=%s | requête='%s...' | %d document(s) de contexte.",
+                    conversation_id,
+                    (message[:80] + "…") if len(message) > 80 else message,
+                    len(docs),
+                )
+                if not docs:
+                    logger.warning(
+                        "RAGPipeline.stream_query — aucun document retourné par Qdrant pour conv=%s. "
+                        "Vérifier l'ingestion (chunks indexés) et la collection '%s'.",
+                        conversation_id,
+                        self._store._collection if hasattr(self._store, "_collection") else "inconnue",
+                    )
+                else:
+                    preview = [
+                        {
+                            "source": d.metadata.get("source"),
+                            "filename": d.metadata.get("filename") or d.metadata.get("source"),
+                            "page": d.metadata.get("page"),
+                        }
+                        for d in docs[:5]
+                    ]
+                    logger.debug("RAGPipeline.stream_query — premiers documents de contexte: %s", preview)
+                embed_usage = self._store.get_last_embeddings_usage() or {}
 
-        doc_block = (
-            f"\n\n=== DOCUMENTS PERTINENTS (base documentaire Telko) ===\n{context}"
-            if not use_openwebui_kb
-            else ""
-        )
+            if ids:
+                context = _format_mention_context(docs)
+            else:
+                context = _format_context(docs)
+            if ids:
+                mctx = model_context_tokens if model_context_tokens and model_context_tokens > 0 else _DEFAULT_MODEL_CONTEXT_TOKENS
+                cap = _mention_context_char_cap(
+                    model_context_tokens=mctx,
+                    role_name=role_name,
+                    department=department,
+                    message=message,
+                    history=history,
+                )
+                if len(context) > cap:
+                    note = _MENTION_TRUNCATION_NOTE
+                    body_cap = max(0, cap - len(note))
+                    context = note + context[:body_cap]
+
+            system_content = (
+                _telko_rag_system_lead()
+                + _format_markdown_instructions_block(role_name, department)
+                + _DOC_SECTION_PREFIX
+                + context
+            )
 
         messages = [
             {
                 "role": "system",
-                "content": (
-                    system_lead
-                    + "Mise en forme attendue (Markdown) :\n"
-                    "- Utilise des titres de niveau 2 (`##`) pour structurer ta réponse (par exemple `## Résumé`, `## Détails`, `## Actions recommandées`).\n"
-                    "- Utilise des listes à puces pour énumérer des points.\n"
-                    "- Mets en **gras** les éléments importants (décisions, chiffres clés, avertissements).\n"
-                    "- Sois clair, concis et évite les phrases trop longues.\n\n"
-                    "Gestion des sources :\n"
-                    "- Quand tu t'appuies sur un document, mentionne-le dans le texte sous la forme `[nom_du_fichier – page X]` lorsque la page est connue.\n"
-                    "- À la toute fin de ta réponse, ajoute OBLIGATOIREMENT une section `## Sources`.\n"
-                    "- Dans `## Sources`, liste uniquement les documents réellement utilisés pour répondre, sous forme de liens Markdown cliquables :\n"
-                    "  - `- [nom_du_fichier – page X](#)` si tu ne connais pas l'URL exacte,\n"
-                    "  - ou `- [nom_du_fichier – page X](URL_COMPLÈTE)` si l'URL est présente dans le texte du contexte.\n\n"
-                    f"L'utilisateur est {role_name or 'un collaborateur'} dans le département {department or 'non précisé'}."
-                    f"{doc_block}"
-                ),
+                "content": system_content,
             },
             # Historique : derniers 10 tours = 20 messages, format user/assistant alterné
             *[

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { FileText } from "lucide-react";
+import { getKnowledgeFileKind, knowledgeFileLucideIcon } from "@/lib/knowledge-files";
 
 interface Doc {
   id: string;
@@ -80,7 +80,12 @@ export default function DocumentMention({ isOpen, query, onSelect, onClose }: Do
       {!loading && docs.length === 0 && (
         <div className="p-3 text-xs text-muted-foreground">Aucun document trouvé</div>
       )}
-      {docs.map((doc, i) => (
+      {docs.map((doc, i) => {
+        const pathOrTitle = doc.file_path || doc.title;
+        const Icon = doc.file_path
+          ? knowledgeFileLucideIcon(getKnowledgeFileKind(pathOrTitle))
+          : knowledgeFileLucideIcon("unknown");
+        return (
         <button
           key={doc.id}
           className={`w-full text-left px-3 py-2 flex items-center gap-2 text-sm transition-colors ${
@@ -92,10 +97,11 @@ export default function DocumentMention({ isOpen, query, onSelect, onClose }: Do
           }}
           onMouseEnter={() => setSelectedIndex(i)}
         >
-          <FileText className="h-4 w-4 shrink-0 text-primary" />
+          <Icon className="h-4 w-4 shrink-0 text-primary" />
           <span className="truncate">{doc.title}</span>
         </button>
-      ))}
+        );
+      })}
     </div>
   );
 }

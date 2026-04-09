@@ -17,6 +17,15 @@ function emptyRow(): AssistantGameQuestion {
   return { icon: "💬", text: "" };
 }
 
+function cleanGameQuestions(items: AssistantGameQuestion[]): AssistantGameQuestion[] {
+  return items
+    .map((q) => ({
+      icon: (q.icon || "💬").trim() || "💬",
+      text: q.text.trim(),
+    }))
+    .filter((q) => q.text.length > 0);
+}
+
 export default function QuestionGame() {
   const { toast } = useToast();
   const [items, setItems] = useState<AssistantGameQuestion[]>([]);
@@ -56,13 +65,7 @@ export default function QuestionGame() {
   };
 
   const handleSave = async () => {
-    const cleaned = items
-      .map((q) => ({
-        icon: (q.icon || "💬").trim() || "💬",
-        text: q.text.trim(),
-      }))
-      .filter((q) => q.text.length > 0);
-
+    const cleaned = cleanGameQuestions(items);
     setSaving(true);
     try {
       const saved = await saveAssistantGameQuestions(cleaned);
@@ -73,6 +76,36 @@ export default function QuestionGame() {
       toast({
         title: "Échec de l'enregistrement",
         description: e instanceof Error ? e.message : "Erreur réseau",
+        variant: "destructive",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeRowAt = async (index: number) => {
+    let next: AssistantGameQuestion[] = [];
+    setItems((prev) => {
+      next = prev.filter((_, j) => j !== index);
+      return next;
+    });
+    const cleaned = cleanGameQuestions(next);
+    setSaving(true);
+    try {
+      const saved = await saveAssistantGameQuestions(cleaned);
+      setItems(saved.length > 0 ? saved : [emptyRow()]);
+      toast({ title: "Question supprimée", description: "La liste a été enregistrée sur le serveur." });
+    } catch (e) {
+      console.error(e);
+      try {
+        const list = await fetchAssistantGameQuestions();
+        setItems(list.length > 0 ? list : [emptyRow()]);
+      } catch {
+        /* garde l’état local si le rechargement échoue */
+      }
+      toast({
+        title: "Suppression impossible",
+        description: e instanceof Error ? e.message : "Erreur réseau — la liste a été rechargée.",
         variant: "destructive",
       });
     } finally {
@@ -101,7 +134,8 @@ export default function QuestionGame() {
           <CardHeader>
             <CardTitle>Questions suggérées</CardTitle>
             <CardDescription>
-              Icône (emoji optionnel) et texte. Les lignes sans texte sont ignorées à l’enregistrement.
+              Icône (emoji optionnel) et texte. Les lignes sans texte sont ignorées à l’enregistrement. Supprimer une
+              ligne l’enlève tout de suite de la liste partagée (enregistrement automatique).
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -178,7 +212,8 @@ export default function QuestionGame() {
                           variant="outline"
                           size="icon"
                           className="h-8 w-8 text-destructive hover:text-destructive"
-                          onClick={() => setItems((prev) => prev.filter((_, j) => j !== i))}
+                          disabled={saving}
+                          onClick={() => void removeRowAt(i)}
                           aria-label="Supprimer"
                         >
                           <Trash2 className="h-4 w-4" />

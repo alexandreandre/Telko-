@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import AppLayout from "@/components/AppLayout";
+import KnowledgeFilePreview from "@/components/knowledge/KnowledgeFilePreview";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +15,15 @@ import { useToast } from "@/hooks/use-toast";
 import ReactMarkdown from "react-markdown";
 import jsPDF from "jspdf";
 import { getApiBaseUrl } from "@/lib/api";
+import {
+  extractDocumentTextViaApi,
+  getKnowledgeFileKind,
+  isAllowedKnowledgeUpload,
+  KNOWLEDGE_UPLOAD_ACCEPT,
+  knowledgeFileKindLabel,
+  knowledgeFileLucideIcon,
+  suggestedDownloadFilename,
+} from "@/lib/knowledge-files";
 import { extractPdfText } from "@/lib/pdf-text";
 
 interface KnowledgeDoc {
@@ -25,14 +36,23 @@ interface KnowledgeDoc {
   user_id: string;
 }
 
+type OpenDocState = {
+  title: string;
+  content: string;
+  fileBlobUrl: string | null;
+  fileBlob: Blob | null;
+  storagePath: string | null;
+};
+
 export default function KnowledgeBase() {
   const { user } = useAuth();
   const { toast } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [documents, setDocuments] = useState<KnowledgeDoc[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
-  const [openDoc, setOpenDoc] = useState<{ title: string; content: string; pdfUrl: string | null } | null>(null);
+  const [openDoc, setOpenDoc] = useState<OpenDocState | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
 
   const loadDocuments = useCallback(async () => {
@@ -47,6 +67,60 @@ export default function KnowledgeBase() {
   }, []);
 
   useEffect(() => { loadDocuments(); }, [loadDocuments]);
+
+  const openDocument = useCallback(
+    async (doc: KnowledgeDoc) => {
+      if (doc.file_path) {
+        setIsDownloading(doc.id);
+        const { data, error } = await supabase.storage.from("knowledge-files").download(doc.file_path);
+        setIsDownloading(null);
+
+        if (error || !data) {
+          toast({
+            title: "Erreur",
+            description: "Impossible de prévisualiser ce document.",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        const blobUrl = URL.createObjectURL(data);
+        setOpenDoc({
+          title: doc.title,
+          content: "",
+          fileBlobUrl: blobUrl,
+          fileBlob: data,
+          storagePath: doc.file_path,
+        });
+        return;
+      }
+
+      setOpenDoc({
+        title: doc.title,
+        content: doc.content,
+        fileBlobUrl: null,
+        fileBlob: null,
+        storagePath: null,
+      });
+    },
+    [toast],
+  );
+
+  const docQueryId = searchParams.get("doc");
+  useEffect(() => {
+    if (!docQueryId || isLoading) return;
+    const doc = documents.find((d) => d.id === docQueryId);
+    if (!doc) return;
+    void openDocument(doc);
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("doc");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [docQueryId, isLoading, documents, openDocument, setSearchParams]);
 
   const generatePdfFromContent = (title: string, content: string): Blob => {
     const doc = new jsPDF({ putOnlyUsedFonts: true, compress: true });
@@ -223,42 +297,34 @@ export default function KnowledgeBase() {
 
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
 
-  const openDocument = async (doc: KnowledgeDoc) => {
-    if (doc.file_path) {
-      setIsDownloading(doc.id);
-      const { data, error } = await supabase.storage
-        .from("knowledge-files")
-        .download(doc.file_path);
-      setIsDownloading(null);
-
-      if (error || !data) {
-        toast({ title: "Erreur", description: "Impossible de prévisualiser ce PDF.", variant: "destructive" });
-        return;
-      }
-
-      const blobUrl = URL.createObjectURL(data);
-      // Ouvre le PDF dans la modale de prévisualisation, sans téléchargement automatique
-      setOpenDoc({ title: doc.title, content: "", pdfUrl: blobUrl });
-      return;
-    }
-
-    setOpenDoc({ title: doc.title, content: doc.content, pdfUrl: null });
-  };
-
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !user) return;
 
-    if (file.type !== "application/pdf" && !file.name.endsWith(".pdf")) {
-      toast({ title: "Format non supporté", description: "Seuls les fichiers PDF sont acceptés.", variant: "destructive" });
+    if (!isAllowedKnowledgeUpload(file)) {
+      toast({
+        title: "Format non supporté",
+        description:
+          "Formats acceptés : PDF, Word (.doc, .docx), Excel (.xls, .xlsx), PowerPoint (.ppt, .pptx). Vérifiez aussi le type MIME si votre navigateur le signale.",
+        variant: "destructive",
+      });
       return;
     }
 
     setIsUploading(true);
     try {
-      const extractedContent = await extractPdfText(file);
+      const { data: sess } = await supabase.auth.getSession();
+      const token = sess.session?.access_token;
+      if (!token) throw new Error("Session requise pour indexer un document.");
+
+      let extractedContent: string;
+      if (getKnowledgeFileKind(file.name) === "pdf") {
+        extractedContent = await extractPdfText(file);
+      } else {
+        extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+      }
       if (!extractedContent.trim()) {
-        throw new Error("Aucun texte exploitable détecté dans ce PDF.");
+        throw new Error("Aucun texte exploitable détecté dans ce fichier.");
       }
 
       const filePath = `${user.id}/${Date.now()}-${file.name}`;
@@ -270,10 +336,6 @@ export default function KnowledgeBase() {
       const title = file.name.replace(/\.[^.]+$/, "");
 
       const apiBase = getApiBaseUrl();
-      const { data: sess } = await supabase.auth.getSession();
-      const token = sess.session?.access_token;
-      if (!token) throw new Error("Session requise pour indexer un document.");
-
       const resp = await fetch(`${apiBase}/embed-document`, {
         method: "POST",
         headers: {
@@ -292,7 +354,7 @@ export default function KnowledgeBase() {
         throw new Error((errBody as { error?: string }).error || resp.statusText);
       }
 
-      toast({ title: "PDF ajouté", description: `${file.name} a été indexé avec son contenu texte.` });
+      toast({ title: "Document ajouté", description: `${file.name} a été indexé avec son contenu texte.` });
       loadDocuments();
     } catch (e) {
       console.error(e);
@@ -335,16 +397,22 @@ export default function KnowledgeBase() {
               Base documentaire
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Uploadez vos PDF pour enrichir les réponses de l'assistant IA.
+              Uploadez des PDF ou des documents Office (Word, Excel, PowerPoint) pour enrichir l&apos;assistant IA.
             </p>
           </div>
           <div className="flex gap-2">
             <label>
-              <input type="file" className="hidden" accept=".pdf" onChange={handleFileUpload} disabled={isUploading} />
+              <input
+                type="file"
+                className="hidden"
+                accept={KNOWLEDGE_UPLOAD_ACCEPT}
+                onChange={handleFileUpload}
+                disabled={isUploading}
+              />
               <Button asChild disabled={isUploading}>
                 <span className="cursor-pointer">
                   {isUploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
-                  Uploader un PDF
+                  Uploader un document
                 </span>
               </Button>
             </label>
@@ -374,7 +442,7 @@ export default function KnowledgeBase() {
               </div>
             ) : filtered.length === 0 ? (
               <p className="text-center text-sm text-muted-foreground py-8">
-                Aucun document trouvé. Uploadez des PDF pour enrichir l'assistant.
+                Aucun document trouvé. Uploadez des fichiers pour enrichir l&apos;assistant.
               </p>
             ) : (
               <Table>
@@ -387,7 +455,11 @@ export default function KnowledgeBase() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filtered.map((doc) => (
+                  {filtered.map((doc) => {
+                    const pathOrTitle = doc.file_path || doc.title;
+                    const kind = doc.file_path ? getKnowledgeFileKind(pathOrTitle) : null;
+                    const RowIcon = kind ? knowledgeFileLucideIcon(kind) : FileText;
+                    return (
                     <TableRow
                       key={doc.id}
                       className="cursor-pointer hover:bg-muted/50"
@@ -398,14 +470,14 @@ export default function KnowledgeBase() {
                           {isDownloading === doc.id ? (
                             <Loader2 className="h-4 w-4 animate-spin text-destructive shrink-0" />
                           ) : (
-                            <FileText className="h-4 w-4 text-destructive shrink-0" />
+                            <RowIcon className="h-4 w-4 text-destructive shrink-0" />
                           )}
                           {doc.title}
                         </div>
                       </TableCell>
                       <TableCell>
                         <Badge variant={doc.file_path ? "secondary" : "outline"} className="text-[10px]">
-                          {doc.file_path ? "PDF" : "Texte"}
+                          {doc.file_path && kind ? knowledgeFileKindLabel(kind) : "Texte"}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
@@ -423,7 +495,8 @@ export default function KnowledgeBase() {
                         )}
                       </TableCell>
                     </TableRow>
-                  ))}
+                  );
+                  })}
                 </TableBody>
               </Table>
             )}
@@ -435,7 +508,7 @@ export default function KnowledgeBase() {
         open={!!openDoc}
         onOpenChange={(open) => {
           if (!open) {
-            if (openDoc?.pdfUrl) URL.revokeObjectURL(openDoc.pdfUrl);
+            if (openDoc?.fileBlobUrl) URL.revokeObjectURL(openDoc.fileBlobUrl);
             setOpenDoc(null);
           }
         }}
@@ -443,15 +516,23 @@ export default function KnowledgeBase() {
         <DialogContent className="max-w-5xl max-h-[95vh] flex flex-col">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <FileText className="h-5 w-5 text-destructive" />
+              {(() => {
+                const p = openDoc?.storagePath || openDoc?.title || "";
+                const Icon = openDoc?.fileBlob
+                  ? knowledgeFileLucideIcon(getKnowledgeFileKind(p))
+                  : FileText;
+                return <Icon className="h-5 w-5 text-destructive" />;
+              })()}
               {openDoc?.title}
             </DialogTitle>
             <DialogDescription className="flex items-center justify-between">
-              <span>{openDoc?.pdfUrl ? "Aperçu du document PDF" : "Contenu du document"}</span>
-              {openDoc?.pdfUrl && (
+              <span>
+                {openDoc?.fileBlobUrl ? "Aperçu du document" : "Contenu du document (texte ou markdown)"}
+              </span>
+              {openDoc?.fileBlobUrl && (
                 <a
-                  href={openDoc.pdfUrl}
-                  download={`${openDoc.title}.pdf`}
+                  href={openDoc.fileBlobUrl}
+                  download={suggestedDownloadFilename(openDoc.title, openDoc.storagePath)}
                   className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
                 >
                   <Download className="h-3 w-3" />
@@ -460,23 +541,12 @@ export default function KnowledgeBase() {
               )}
             </DialogDescription>
           </DialogHeader>
-          {openDoc?.pdfUrl ? (
-            <object
-              data={openDoc.pdfUrl}
-              type="application/pdf"
-              className="w-full flex-1 min-h-[70vh] rounded border"
-            >
-              <div className="flex flex-col items-center justify-center gap-4 py-12">
-                <FileText className="h-16 w-16 text-muted-foreground" />
-                <p className="text-sm text-muted-foreground">Votre navigateur ne peut pas afficher ce PDF.</p>
-                <Button asChild>
-                  <a href={openDoc.pdfUrl} download={`${openDoc.title}.pdf`}>
-                    <Download className="mr-2 h-4 w-4" />
-                    Télécharger le PDF
-                  </a>
-                </Button>
-              </div>
-            </object>
+          {openDoc?.fileBlobUrl && openDoc.fileBlob ? (
+            <KnowledgeFilePreview
+              blob={openDoc.fileBlob}
+              blobUrl={openDoc.fileBlobUrl}
+              downloadFileName={suggestedDownloadFilename(openDoc.title, openDoc.storagePath)}
+            />
           ) : (
             <div className="prose prose-sm max-w-none dark:prose-invert overflow-y-auto max-h-[70vh] p-4">
               <ReactMarkdown>{openDoc?.content ?? ""}</ReactMarkdown>

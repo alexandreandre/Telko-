@@ -34,6 +34,10 @@ class ChatBody(BaseModel):
     conversation_id: str | None = None
     provider: str | None = None
     model: str | None = None
+    # Identifiants Qdrant metadata.source (ex. supabase:<uuid>) pour @mentions sans coller tout le texte.
+    mentioned_source_ids: list[str] | None = None
+    # Fenêtre de contexte du modèle (tokens), ex. champ context_length d’OpenRouter — pour borner le texte @mention.
+    model_context_tokens: int | None = None
 
 
 @router.post("/chat")
@@ -64,6 +68,8 @@ async def chat(body: ChatBody):
                 role_name=body.role_name or "",
                 department=body.department or "",
                 llm=llm,
+                mentioned_source_ids=body.mentioned_source_ids,
+                model_context_tokens=body.model_context_tokens,
             ):
                 if not isinstance(item, dict):
                     # Compat backward si d'autres implémentations renvoient encore un str
