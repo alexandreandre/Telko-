@@ -54,12 +54,17 @@ async def chat(body: ChatBody):
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
+    run_id = str(uuid4())
+
     async def event_stream():
         try:
             import time
 
             t_start = time.perf_counter()
             first_token_ms: float | None = None
+            resolved_model = getattr(llm, "model", None)
+            if not isinstance(resolved_model, str) or not resolved_model.strip():
+                resolved_model = body.model or ""
 
             async for item in pipeline.stream_query(
                 message=message,
@@ -93,8 +98,10 @@ async def chat(body: ChatBody):
                     now = time.perf_counter()
                     response_time_ms = (now - t_start) * 1000.0
                     meta = {
+                        "run_id": run_id,
+                        "conversation_id": conversation_id,
                         "provider": body.provider or "openrouter",
-                        "model": body.model or "",
+                        "model": resolved_model,
                         "timing": {
                             "response_time_ms": round(response_time_ms),
                             "first_token_ms": round(first_token_ms or response_time_ms),

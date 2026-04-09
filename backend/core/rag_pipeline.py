@@ -317,6 +317,27 @@ class RAGPipeline:
         use_openwebui_kb = isinstance(active_llm, OpenWebUIProvider) and bool(
             getattr(active_llm, "chat_files", None)
         )
+        n_mention = len([x for x in (mentioned_source_ids or []) if (x or "").strip()])
+        ow_files_n = (
+            len(getattr(active_llm, "chat_files", None) or [])
+            if isinstance(active_llm, OpenWebUIProvider)
+            else 0
+        )
+        if use_openwebui_kb:
+            rag_branch = "openwebui_kb_qdrant_bypass"
+        elif n_mention:
+            rag_branch = "qdrant_fetch_by_mention"
+        else:
+            rag_branch = "qdrant_semantic_k5"
+        logger.info(
+            "Telko diag | rag_request | conv=%s | provider_openwebui=%s | ow_files_entries=%s | "
+            "mentions=%d | branch=%s",
+            conversation_id,
+            isinstance(active_llm, OpenWebUIProvider),
+            ow_files_n,
+            n_mention,
+            rag_branch,
+        )
 
         if use_openwebui_kb:
             docs = []

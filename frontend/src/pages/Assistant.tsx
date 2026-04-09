@@ -47,6 +47,8 @@ import { partitionModelsForAssistant } from "@/lib/relevantModels";
 interface MessageMeta {
   provider: string;
   model: string;
+  /** UUID du run LLM (ligne `llm_runs` Supabase, pour la notation ultérieure). */
+  run_id?: string;
   timing?: {
     response_time_ms?: number;
     first_token_ms?: number;
@@ -777,6 +779,7 @@ export default function Assistant() {
           rating,
           response_time_ms: responseTimeForFeedback,
           conversation_id: activeConvId ?? undefined,
+          llm_run_id: assistantMsg.replyMeta?.run_id,
         }),
       });
       if (assistantMsg.id) {

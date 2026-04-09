@@ -887,7 +887,9 @@ export default function LLMComparator() {
                       <TableCell className="text-right">{fmtNum(u.avg_total_tokens)}</TableCell>
                       <TableCell className="text-right">
                         {u.feedback?.satisfaction_rate != null
-                          ? `${u.feedback.satisfaction_rate.toFixed(1)} %`
+                          ? `${u.feedback.satisfaction_rate.toFixed(1)} %${
+                              u.feedback.count != null ? ` (${u.feedback.count} avis)` : ""
+                            }`
                           : "—"}
                       </TableCell>
                     </TableRow>

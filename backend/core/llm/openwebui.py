@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any, AsyncGenerator, TypedDict
 from urllib.parse import urljoin
 
@@ -8,6 +9,7 @@ from config import settings
 from core.llm.base import BaseLLMProvider, LLMProviderError
 
 _PROVIDER = "openwebui"
+logger = logging.getLogger(__name__)
 
 
 def build_openwebui_chat_files() -> list[dict[str, str]] | None:
@@ -34,6 +36,48 @@ def build_openwebui_chat_files() -> list[dict[str, str]] | None:
     if cid:
         return [{"type": "collection", "id": cid}]
     return None
+
+
+def diagnose_openwebui_chat_files_config() -> dict[str, Any]:
+    """
+    Résumé sans secrets pour les logs (copier-coller vers support / débug).
+    """
+    raw = (settings.openwebui_chat_files_json or "").strip()
+    cid = (settings.openwebui_knowledge_collection_id or "").strip()
+    diag: dict[str, Any] = {
+        "OPENWEBUI_CHAT_FILES_JSON": "nonempty" if raw else "empty",
+        "OPENWEBUI_KNOWLEDGE_COLLECTION_ID": "nonempty" if cid else "empty",
+    }
+    if raw:
+        try:
+            data = json.loads(raw)
+            diag["chat_files_json_parse"] = "ok"
+            if isinstance(data, list):
+                diag["chat_files_json_list_len"] = len(data)
+                diag["chat_files_json_entry_types"] = [
+                    str(item.get("type", "?")) for item in data if isinstance(item, dict)
+                ][:12]
+            else:
+                diag["chat_files_json_parse"] = "ok_but_not_a_list"
+        except json.JSONDecodeError:
+            diag["chat_files_json_parse"] = "invalid_json"
+    built = build_openwebui_chat_files()
+    diag["resolved_payload_files_count"] = len(built) if built else 0
+    diag["simple_message_rag_expected"] = (
+        "openwebui_api_files_then_server_rag"
+        if built
+        else "telko_embed_qdrant_in_system_prompt"
+    )
+    return diag
+
+
+def log_openwebui_rag_config_at_startup(log: logging.Logger) -> None:
+    """À appeler une fois au démarrage du backend."""
+    diag = diagnose_openwebui_chat_files_config()
+    log.info(
+        "Telko diag | startup | openwebui_knowledge=%s",
+        json.dumps(diag, ensure_ascii=False, sort_keys=True),
+    )
 
 
 class OpenWebUIUsage(TypedDict, total=False):
@@ -80,8 +124,21 @@ class OpenWebUIProvider(BaseLLMProvider):
             payload["files"] = self.chat_files
         return payload
 
+    def _log_payload_diag(self, payload: dict[str, Any]) -> None:
+        files = payload.get("files")
+        n = len(files) if isinstance(files, list) else 0
+        types = [str(x.get("type", "?")) for x in files] if isinstance(files, list) else []
+        logger.info(
+            "Telko diag | openwebui_post | url=%s | stream=%s | files_entries=%d | file_types=%s",
+            self._url,
+            payload.get("stream"),
+            n,
+            types,
+        )
+
     async def generate(self, messages: list[dict]) -> str:
         payload = self._payload(messages, stream=False)
+        self._log_payload_diag(payload)
         try:
             async with httpx.AsyncClient(timeout=self._httpx_timeout()) as client:
                 resp = await client.post(self._url, headers=self._headers(), json=payload)
@@ -104,6 +161,7 @@ class OpenWebUIProvider(BaseLLMProvider):
         self, messages: list[dict]
     ) -> AsyncGenerator[tuple[str | None, OpenWebUIUsage | None], None]:
         payload = self._payload(messages, stream=True)
+        self._log_payload_diag(payload)
         try:
             async with httpx.AsyncClient(timeout=self._httpx_timeout()) as client:
                 async with client.stream(

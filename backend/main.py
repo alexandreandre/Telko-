@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import admin_user, chat, embed, extract_document, feedback, game_questions, health, llm
 from config import settings
+from core.llm.openwebui import log_openwebui_rag_config_at_startup
 from core.pipeline_instance import get_pipeline, _pipeline
 from core.supabase_sync import sync_supabase_knowledge_to_qdrant
 
@@ -58,6 +59,7 @@ async def startup():
         ow_key,
         ow_model,
     )
+    log_openwebui_rag_config_at_startup(logger)
     try:
         logger.info("Initialisation du pipeline RAG (Qdrant + OpenRouter)...")
         _pipeline.init()

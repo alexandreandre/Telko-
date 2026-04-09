@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from core.feedback_store import get_feedback_store
+from core.llm_stats import patch_llm_run_rating
 
 router = APIRouter(prefix="/feedback")
 
@@ -17,6 +18,8 @@ class FeedbackBody(BaseModel):
     cost_estimate_usd: float | None = None
     conversation_id: str | None = None
     user_id: str | None = None
+    # Ligne `llm_runs` à mettre à jour (notation après coup)
+    llm_run_id: str | None = None
 
 
 @router.post("/")
@@ -33,6 +36,8 @@ async def submit_feedback(body: FeedbackBody):
         conversation_id=body.conversation_id,
         user_id=body.user_id,
     )
+    if body.llm_run_id:
+        patch_llm_run_rating(body.llm_run_id, body.rating)
     return {"id": feedback_id, "status": "saved"}
 
 
