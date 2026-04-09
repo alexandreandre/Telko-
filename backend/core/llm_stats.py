@@ -208,8 +208,10 @@ def _insert_run_supabase(payload: Dict[str, Any]) -> None:
     url = f"{base_url}/rest/v1/{_SUPABASE_TABLE}"
 
     try:
+        # PostgREST : « return=minimal » doit aller dans Prefer, pas en query (?return=… est parsé comme filtre).
+        post_headers = {**headers, "Prefer": "return=minimal"}
         with httpx.Client(timeout=3.0) as client:
-            resp = client.post(url, headers=headers, json=payload, params={"return": "minimal"})
+            resp = client.post(url, headers=post_headers, json=payload)
         if not resp.is_success:
             logger.warning(
                 "record_llm_run — échec insertion Supabase (%s): %s",

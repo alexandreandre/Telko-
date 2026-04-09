@@ -3,10 +3,11 @@ Synchronisation des documents Supabase -> Qdrant.
 
 Objectif :
   - Relire la table `knowledge_documents` de Supabase
-  - Réindexer chaque document dans Qdrant via RAGPipeline.ingest_document()
-  - Rendre l'opération idempotente en supprimant d'abord les anciens points pour chaque doc
+  - N’indexer que les documents absents de Qdrant ou dont `updated_at` a changé
+  - Sinon : aucun appel embedding (skip)
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -21,10 +22,10 @@ logger = logging.getLogger(__name__)
 async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
     """
     Relit tous les documents de `knowledge_documents` dans Supabase
-    et les (ré)indexe dans Qdrant.
+    et n’appelle ingest (embed + upsert) que si nécessaire.
 
     Returns:
-        Nombre de documents Supabase effectivement indexés.
+        Nombre de documents effectivement (ré)indexés (embeddings).
     """
     if not settings.supabase_url or not (
         settings.supabase_service_role_key or settings.supabase_anon_key
@@ -47,7 +48,7 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
     }
     # On récupère les champs utiles uniquement
     params: dict[str, Any] = {
-        "select": "id,title,content,file_path,source_type",
+        "select": "id,title,content,file_path,source_type,updated_at",
         "order": "id.asc",
         "limit": 5000,  # suffisant pour la plupart des cas ; à ajuster au besoin
     }
@@ -55,6 +56,7 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
     logger.info("Sync Supabase -> Qdrant démarrée (lecture de knowledge_documents).")
 
     indexed_count = 0
+    skipped_up_to_date = 0
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.get(url, headers=headers, params=params)
@@ -74,7 +76,7 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
                 )
                 return 0
 
-            logger.info("Supabase a renvoyé %d document(s) à synchroniser.", len(rows))
+            logger.info("Supabase a renvoyé %d document(s) à vérifier.", len(rows))
 
             for row in rows:
                 doc_id = row.get("id")
@@ -82,6 +84,8 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
                 title = row.get("title") or ""
                 file_path = row.get("file_path")
                 source_type = row.get("source_type") or "manual"
+                updated_at = row.get("updated_at")
+                updated_at_s = str(updated_at).strip() if updated_at is not None else ""
 
                 if not doc_id or not content:
                     # Rien à indexer pour ce document
@@ -89,9 +93,28 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
 
                 source_id = f"supabase:{doc_id}"
 
-                # On supprime d'abord les anciens points pour ce document
+                store = pipeline._store  # type: ignore[attr-defined]
                 try:
-                    await pipeline._store.delete_document(source_id)  # type: ignore[attr-defined]
+                    stored_rev = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        store.get_stored_supabase_updated_at,
+                        source_id,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(
+                        "sync_supabase_knowledge_to_qdrant — lecture révision Qdrant '%s' : %s",
+                        source_id,
+                        exc,
+                    )
+                    stored_rev = None
+
+                if stored_rev is not None and updated_at_s and stored_rev == updated_at_s:
+                    skipped_up_to_date += 1
+                    continue
+
+                # Nouveau doc, contenu modifié, ou index sans supabase_updated_at : réindexer
+                try:
+                    await store.delete_document(source_id)
                 except Exception as exc:  # pragma: no cover - dépend de Qdrant externe
                     logger.warning(
                         "sync_supabase_knowledge_to_qdrant — suppression partielle pour '%s' : %s",
@@ -105,6 +128,7 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
                     "page": 1,
                     "source_type": source_type,
                     "file_path": file_path,
+                    "supabase_updated_at": updated_at_s,
                 }
 
                 try:
@@ -125,7 +149,9 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
         return indexed_count
 
     logger.info(
-        "Sync Supabase -> Qdrant terminée — %d document(s) indexé(s).", indexed_count
+        "Sync Supabase -> Qdrant terminée — %d document(s) (ré)indexé(s), %d déjà à jour (skip).",
+        indexed_count,
+        skipped_up_to_date,
     )
     return indexed_count
 

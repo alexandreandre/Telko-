@@ -64,9 +64,9 @@ def diagnose_openwebui_chat_files_config() -> dict[str, Any]:
     built = build_openwebui_chat_files()
     diag["resolved_payload_files_count"] = len(built) if built else 0
     diag["simple_message_rag_expected"] = (
-        "openwebui_api_files_then_server_rag"
+        "openwebui_api_files_plus_server_rag"
         if built
-        else "telko_embed_qdrant_in_system_prompt"
+        else "openwebui_server_only_no_telko_qdrant"
     )
     return diag
 

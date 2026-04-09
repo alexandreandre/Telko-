@@ -302,8 +302,8 @@ class RAGPipeline:
         Interroge le pipeline RAG et yield les tokens au fur et à mesure.
 
           1. Récupère l'historique de la conversation
-          2. Contexte : soit tous les chunks Qdrant pour `mentioned_source_ids` (@mention),
-             soit recherche sémantique (k=5)
+          2. Contexte : provider Open Web UI → pas de Qdrant Telko (RAG délégué à l’instance OW) ;
+             sinon chunks Qdrant pour `mentioned_source_ids` (@mention) ou recherche sémantique (k=5).
           3. Construit les messages au format OpenAI-like avec contexte + historique
           4. Stream via le LLM provider
 
@@ -314,17 +314,17 @@ class RAGPipeline:
         history = self._get_history(conversation_id)
 
         active_llm = llm or self._llm
-        use_openwebui_kb = isinstance(active_llm, OpenWebUIProvider) and bool(
-            getattr(active_llm, "chat_files", None)
-        )
+        # Open Web UI : le RAG documentaire est toujours délégué à l’instance OW (fichiers API + config serveur),
+        # jamais via embeddings / Qdrant Telko (évite mélange de deux bases).
+        openwebui_delegated_rag = isinstance(active_llm, OpenWebUIProvider)
         n_mention = len([x for x in (mentioned_source_ids or []) if (x or "").strip()])
         ow_files_n = (
             len(getattr(active_llm, "chat_files", None) or [])
             if isinstance(active_llm, OpenWebUIProvider)
             else 0
         )
-        if use_openwebui_kb:
-            rag_branch = "openwebui_kb_qdrant_bypass"
+        if openwebui_delegated_rag:
+            rag_branch = "openwebui_with_files_param" if ow_files_n else "openwebui_no_files_param"
         elif n_mention:
             rag_branch = "qdrant_fetch_by_mention"
         else:
@@ -339,20 +339,41 @@ class RAGPipeline:
             rag_branch,
         )
 
-        if use_openwebui_kb:
+        if openwebui_delegated_rag:
             docs = []
             embed_usage = {}
             context = ""
-            logger.info(
-                "RAGPipeline.stream_query — conv=%s | requête='%s...' | RAG Open WebUI (collections/fichiers), Qdrant Telko ignoré.",
-                conversation_id,
-                (message[:80] + "…") if len(message) > 80 else message,
-            )
+            if ow_files_n:
+                logger.info(
+                    "RAGPipeline.stream_query — conv=%s | requête='%s...' | RAG Open WebUI (paramètre files=%d), "
+                    "Qdrant Telko ignoré.",
+                    conversation_id,
+                    (message[:80] + "…") if len(message) > 80 else message,
+                    ow_files_n,
+                )
+            else:
+                logger.info(
+                    "RAGPipeline.stream_query — conv=%s | requête='%s...' | RAG uniquement côté instance Open WebUI "
+                    "(pas de paramètre files Telko), Qdrant Telko ignoré.",
+                    conversation_id,
+                    (message[:80] + "…") if len(message) > 80 else message,
+                )
             openwebui_lead = (
                 "Tu es un assistant interne pour une société de télécom et tu réponds TOUJOURS en français. "
-                "Open WebUI enrichit cette requête avec des extraits issus de la base de connaissances configurée "
-                "sur l’instance (paramètre `files` de l’API). Réponds en t’appuyant sur le contexte que Open WebUI "
-                "injecte ; si l’information n’y figure pas, dis-le clairement.\n\n"
+            )
+            if ow_files_n:
+                openwebui_lead += (
+                    "Telko transmet à Open WebUI des références de base documentaire (paramètre `files` de l’API) ; "
+                    "l’instance doit enrichir la requête avec les extraits pertinents. "
+                )
+            else:
+                openwebui_lead += (
+                    "La recherche documentaire (RAG) doit être assurée par l’instance Open WebUI "
+                    "(configuration Knowledge / pipelines côté serveur), pas par la base Telko (Qdrant). "
+                )
+            openwebui_lead += (
+                "Réponds en t’appuyant sur le contexte qu’Open WebUI injecte dans la conversation ; "
+                "si l’information n’y figure pas, dis-le clairement.\n\n"
             )
             system_content = openwebui_lead + _format_markdown_instructions_block(role_name, department)
         else:

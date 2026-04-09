@@ -426,6 +426,44 @@ class QdrantStore:
         logger.info("fetch_all_by_source('%s') → %d chunk(s).", source_id, len(out))
         return out
 
+    def get_stored_supabase_updated_at(self, source_id: str) -> str | None:
+        """
+        Lit metadata.supabase_updated_at sur un point quelconque pour ce source_id.
+        Retourne None si aucun point ou si la clé est absente (index hérité d’une ancienne version).
+        """
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("get_stored_supabase_updated_at — init_collection : %s", exc)
+            return None
+
+        filt = Filter(
+            must=[FieldCondition(key="metadata.source", match=MatchValue(value=source_id))]
+        )
+        try:
+            records, _ = self._client.scroll(
+                collection_name=self._collection,
+                scroll_filter=filt,
+                limit=1,
+                offset=None,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            logger.error("Erreur Qdrant (scroll get_stored_supabase_updated_at) : %s", exc)
+            return None
+
+        if not records:
+            return None
+        payload = records[0].payload or {}
+        meta = payload.get("metadata")
+        if not isinstance(meta, dict):
+            return None
+        raw = meta.get("supabase_updated_at")
+        if raw is None:
+            return None
+        return str(raw)
+
     def get_last_embeddings_usage(self) -> dict[str, Any] | None:
         """
         Expose l'usage du dernier appel /embeddings effectué via OpenRouterEmbeddings.

@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     openwebui_model: str = ""
     # Chemin relatif sous la base (par défaut l’endpoint documenté Open WebUI)
     openwebui_chat_path: str = "/api/chat/completions"
-    # RAG côté Open WebUI : ID d’une collection « Knowledge » (UI) → envoyé en `files` sur /api/chat/completions
+    # RAG uniquement côté Open WebUI (Qdrant Telko jamais utilisé pour ce provider).
+    # ID collection « Knowledge » (UI) → envoyé en `files` sur /api/chat/completions (optionnel).
     openwebui_knowledge_collection_id: str = ""
     # Alternative avancée : JSON du tableau `files`, ex. [{"type":"collection","id":"..."},{"type":"file","id":"..."}]
     # Si non vide, il remplace openwebui_knowledge_collection_id.
