@@ -62,6 +62,7 @@ async def chat(body: ChatBody):
 
             t_start = time.perf_counter()
             first_token_ms: float | None = None
+            assistant_text_parts: list[str] = []
             resolved_model = getattr(llm, "model", None)
             if not isinstance(resolved_model, str) or not resolved_model.strip():
                 resolved_model = body.model or ""
@@ -88,15 +89,18 @@ async def chat(body: ChatBody):
                     now = time.perf_counter()
                     if first_token_ms is None:
                         first_token_ms = (now - t_start) * 1000.0
+                    assistant_text_parts.append(item.get("content", "") or "")
                     payload = json.dumps({"choices": [{"delta": {"content": item.get("content", "")}}]})
                     yield f"data: {payload}\n\n"
                 elif kind == "error":
+                    assistant_text_parts.append(item.get("content", "") or "")
                     payload = json.dumps({"choices": [{"delta": {"content": item.get("content", "")}}]})
                     yield f"data: {payload}\n\n"
                 elif kind == "meta":
                     # Chunk final avec les stats d'usage et de temps de réponse
                     now = time.perf_counter()
                     response_time_ms = (now - t_start) * 1000.0
+                    assistant_full = "".join(assistant_text_parts)
                     meta = {
                         "run_id": run_id,
                         "conversation_id": conversation_id,
@@ -107,6 +111,8 @@ async def chat(body: ChatBody):
                             "first_token_ms": round(first_token_ms or response_time_ms),
                         },
                         "usage": item.get("usage", {}),
+                        "user_prompt_excerpt": message[:8000],
+                        "assistant_response_excerpt": assistant_full[:32000],
                     }
                     # Journalisation best-effort pour le comparateur LLM.
                     try:

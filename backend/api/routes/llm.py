@@ -494,12 +494,8 @@ async def get_llm_comparator():
     """
     Endpoint utilisé par la page LLMComparator du frontend.
 
-    Pour l'instant on renvoie :
-    - des stats d'usage et de feedback vides
-    - un catalogue de modèles basé sur les modèles OpenRouter
-    - des agrégats globaux à zéro
-    Cela permet au frontend d'afficher la page sans erreur même si aucun tracking
-    détaillé n'est encore branché.
+    Agrégats d'usage et satisfaction : table Supabase `llm_runs`.
+    Catalogue : modèles OpenRouter (+ entrée Open WebUI Telko si configuré).
     """
     raw_models = await _fetch_openrouter_models()
     # Même filtrage que pour /openrouter/models : pas de modèles « free » ni de routeurs internes.
