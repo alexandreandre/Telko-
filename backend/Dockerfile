@@ -16,7 +16,9 @@ WORKDIR /app
 
 # Installe les dépendances Python en premier (meilleur cache Docker)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# pip livré avec l’image peut être ancien ; une mise à jour évite erreurs de métadonnées / résolution
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copie le code source
 COPY . .
