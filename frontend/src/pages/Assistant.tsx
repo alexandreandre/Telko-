@@ -1320,7 +1320,7 @@ export default function Assistant() {
                           className="cursor-pointer text-xs font-normal leading-snug text-muted-foreground peer-disabled:cursor-not-allowed"
                           title="Décochez pour n’utiliser que la Knowledge / RAG configurée sur l’instance Open WebUI."
                         >
-                          Base Telko (Qdrant)
+                          Base documentaire de l'interface (la même que les autres modèles)
                         </Label>
                       </div>
                     )}
