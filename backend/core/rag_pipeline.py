@@ -303,8 +303,8 @@ class RAGPipeline:
         Interroge le pipeline RAG et yield les tokens au fur et à mesure.
 
           1. Récupère l'historique de la conversation
-          2. Contexte : Open WebUI + `openwebui_knowledge_source=openwebui` (défaut) → RAG côté instance OW ;
-             Open WebUI + `telko` → même LLM OW mais contexte Qdrant Telko (@mention ou k=5) ;
+          2. Contexte : Open WebUI + `openwebui_knowledge_source=telko` (défaut) → contexte Qdrant Telko (@mention ou k=5) ;
+             Open WebUI + `openwebui` → RAG côté instance OW (paramètre `files` si configuré) ;
              sinon chunks Qdrant pour `mentioned_source_ids` (@mention) ou recherche sémantique (k=5).
           3. Construit les messages au format OpenAI-like avec contexte + historique
           4. Stream via le LLM provider
@@ -313,16 +313,16 @@ class RAGPipeline:
 
         `model_context_tokens` : fenêtre du modèle (ex. context_length OpenRouter) pour tronquer le texte @mention.
 
-        `openwebui_knowledge_source` : uniquement si le LLM est OpenWebUIProvider — `openwebui` (défaut) ou `telko`.
+        `openwebui_knowledge_source` : uniquement si le LLM est OpenWebUIProvider — `telko` (défaut) ou `openwebui`.
         """
         history = self._get_history(conversation_id)
 
         active_llm = llm or self._llm
-        raw_ow_src = (openwebui_knowledge_source or "openwebui").strip().lower()
+        raw_ow_src = (openwebui_knowledge_source or "telko").strip().lower()
         if raw_ow_src not in ("openwebui", "telko"):
-            raw_ow_src = "openwebui"
-        # Open Web UI : par défaut RAG délégué à l’instance OW ; si `telko`, on alimente le modèle OW avec Qdrant Telko
-        # et on n’envoie pas le paramètre `files` (évite double RAG).
+            raw_ow_src = "telko"
+        # Open Web UI : si `openwebui`, RAG délégué à l’instance OW (paramètre `files` si configuré).
+        # Si `telko` (défaut), même LLM OW mais contexte Qdrant Telko — pas de `files` (évite double RAG).
         use_openwebui_server_rag = isinstance(active_llm, OpenWebUIProvider) and raw_ow_src == "openwebui"
         n_mention = len([x for x in (mentioned_source_ids or []) if (x or "").strip()])
         ow_files_n = (

@@ -43,13 +43,8 @@ import { extractDocumentTextViaApi, getKnowledgeFileKind } from "@/lib/knowledge
 import { getApiBaseUrl } from "@/lib/api";
 import { fetchAssistantGameQuestions, type AssistantGameQuestion } from "@/lib/assistantGameQuestions";
 import { partitionModelsForAssistant } from "@/lib/relevantModels";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 
 interface MessageMeta {
   provider: string;
@@ -187,7 +182,7 @@ function readPersistedOpenwebuiKnowledgeSource(): OpenwebuiKnowledgeSource {
   } catch {
     /* quota / navigation privée */
   }
-  return "openwebui";
+  return "telko";
 }
 
 function persistOpenwebuiKnowledgeSource(value: OpenwebuiKnowledgeSource) {
@@ -276,7 +271,7 @@ export default function Assistant() {
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionedDocs, setMentionedDocs] = useState<Doc[]>([]);
   const [openwebuiKnowledgeSource, setOpenwebuiKnowledgeSource] = useState<OpenwebuiKnowledgeSource>(() =>
-    typeof window !== "undefined" ? readPersistedOpenwebuiKnowledgeSource() : "openwebui",
+    typeof window !== "undefined" ? readPersistedOpenwebuiKnowledgeSource() : "telko",
   );
   const [docCount, setDocCount] = useState(0);
   const [responseTimeMs, setResponseTimeMs] = useState<number>(0);
@@ -1215,127 +1210,121 @@ export default function Assistant() {
               {/* Sélecteur de modèle OpenRouter (combobox avec recherche intégrée) */}
               {availableModels.length > 0 && (
                 <div className="flex flex-col gap-1 text-xs text-muted-foreground">
-                  <span className="shrink-0">Modèle OpenRouter :</span>
-                  <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
-                    <PopoverTrigger asChild>
-                      <Button
-                        variant="outline"
-                        role="combobox"
-                        aria-expanded={modelPopoverOpen}
-                        className="h-auto min-h-8 max-w-md justify-between text-xs py-1.5 px-3"
-                      >
-                        <div className="flex flex-col items-start gap-0.5 min-w-0 mr-2 text-left">
-                          <span className="truncate w-full">{selectedModelLabel}</span>
-                          {selectedModelPricingLine ? (
-                            <span className="text-[10px] text-muted-foreground font-normal leading-tight truncate w-full">
-                              {selectedModelPricingLine}
-                            </span>
-                          ) : null}
-                        </div>
-                        <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-60" />
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-[min(100vw-2rem,380px)] p-0" align="start">
-                      <Command>
-                        <CommandInput placeholder="Rechercher un modèle…" className="h-8 text-xs" />
-                        <CommandList className="max-h-[min(60vh,320px)]">
-                          <CommandEmpty className="text-[11px] text-muted-foreground px-2 py-2">
-                            Aucun modèle ne correspond à la recherche.
-                          </CommandEmpty>
-                          {modelSelectorSections.map((block, blockIdx) => (
-                            <Fragment key={block.key}>
-                              <div
-                                className={cn(
-                                  "px-2 pb-1 text-sm font-bold text-foreground leading-snug",
-                                  blockIdx > 0 ? "pt-3 border-t border-border mt-1" : "pt-1.5",
-                                )}
-                              >
-                                {block.mainHeading}
-                              </div>
-                              {block.subsections.map((sub) => (
-                                <CommandGroup
-                                  key={`${block.key}-${sub.key}`}
-                                  heading={sub.subHeading}
-                                  className="[&_[cmdk-group-heading]]:font-normal"
-                                >
-                                  {sub.items.map((m) => {
-                                    const priceLine = formatPricingPer1mUsd(
-                                      m.pricing_per_1m_usd?.input ?? undefined,
-                                      m.pricing_per_1m_usd?.output ?? undefined,
-                                    );
-                                    return (
-                                      <CommandItem
-                                        key={m.id}
-                                        value={`${m.name ?? m.id} ${m.id} ${priceLine ?? ""}`}
-                                        onSelect={() => {
-                                          setSelectedModel(m.id);
-                                          persistOpenRouterModel(m.id);
-                                          setModelPopoverOpen(false);
-                                        }}
-                                        className="text-xs py-2"
-                                      >
-                                        <Check
-                                          className={cn(
-                                            "mr-2 h-3.5 w-3.5 shrink-0",
-                                            selectedModel === m.id ? "opacity-100" : "opacity-0",
-                                          )}
-                                        />
-                                        <div className="flex flex-col items-start gap-0.5 min-w-0 flex-1">
-                                          <span className="truncate w-full font-medium leading-tight">
-                                            {m.name ?? m.id}
-                                          </span>
-                                          {priceLine ? (
-                                            <span className="text-[10px] text-muted-foreground/85 leading-tight">
-                                              {priceLine}
-                                            </span>
-                                          ) : (
-                                            <span className="text-[10px] text-muted-foreground/60 italic">
-                                              Tarif API non communiqué
-                                            </span>
-                                          )}
-                                        </div>
-                                      </CommandItem>
-                                    );
-                                  })}
-                                </CommandGroup>
+                  <div className="flex flex-row flex-wrap items-end justify-between gap-x-4 gap-y-2">
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <span className="shrink-0">Modèle OpenRouter :</span>
+                      <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
+                        <PopoverTrigger asChild>
+                          <Button
+                            variant="outline"
+                            role="combobox"
+                            aria-expanded={modelPopoverOpen}
+                            className="h-auto min-h-8 max-w-md justify-between text-xs py-1.5 px-3"
+                          >
+                            <div className="flex flex-col items-start gap-0.5 min-w-0 mr-2 text-left">
+                              <span className="truncate w-full">{selectedModelLabel}</span>
+                              {selectedModelPricingLine ? (
+                                <span className="text-[10px] text-muted-foreground font-normal leading-tight truncate w-full">
+                                  {selectedModelPricingLine}
+                                </span>
+                              ) : null}
+                            </div>
+                            <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-60" />
+                          </Button>
+                        </PopoverTrigger>
+                        <PopoverContent className="w-[min(100vw-2rem,380px)] p-0" align="start">
+                          <Command>
+                            <CommandInput placeholder="Rechercher un modèle…" className="h-8 text-xs" />
+                            <CommandList className="max-h-[min(60vh,320px)]">
+                              <CommandEmpty className="text-[11px] text-muted-foreground px-2 py-2">
+                                Aucun modèle ne correspond à la recherche.
+                              </CommandEmpty>
+                              {modelSelectorSections.map((block, blockIdx) => (
+                                <Fragment key={block.key}>
+                                  <div
+                                    className={cn(
+                                      "px-2 pb-1 text-sm font-bold text-foreground leading-snug",
+                                      blockIdx > 0 ? "pt-3 border-t border-border mt-1" : "pt-1.5",
+                                    )}
+                                  >
+                                    {block.mainHeading}
+                                  </div>
+                                  {block.subsections.map((sub) => (
+                                    <CommandGroup
+                                      key={`${block.key}-${sub.key}`}
+                                      heading={sub.subHeading}
+                                      className="[&_[cmdk-group-heading]]:font-normal"
+                                    >
+                                      {sub.items.map((m) => {
+                                        const priceLine = formatPricingPer1mUsd(
+                                          m.pricing_per_1m_usd?.input ?? undefined,
+                                          m.pricing_per_1m_usd?.output ?? undefined,
+                                        );
+                                        return (
+                                          <CommandItem
+                                            key={m.id}
+                                            value={`${m.name ?? m.id} ${m.id} ${priceLine ?? ""}`}
+                                            onSelect={() => {
+                                              setSelectedModel(m.id);
+                                              persistOpenRouterModel(m.id);
+                                              setModelPopoverOpen(false);
+                                            }}
+                                            className="text-xs py-2"
+                                          >
+                                            <Check
+                                              className={cn(
+                                                "mr-2 h-3.5 w-3.5 shrink-0",
+                                                selectedModel === m.id ? "opacity-100" : "opacity-0",
+                                              )}
+                                            />
+                                            <div className="flex flex-col items-start gap-0.5 min-w-0 flex-1">
+                                              <span className="truncate w-full font-medium leading-tight">
+                                                {m.name ?? m.id}
+                                              </span>
+                                              {priceLine ? (
+                                                <span className="text-[10px] text-muted-foreground/85 leading-tight">
+                                                  {priceLine}
+                                                </span>
+                                              ) : (
+                                                <span className="text-[10px] text-muted-foreground/60 italic">
+                                                  Tarif API non communiqué
+                                                </span>
+                                              )}
+                                            </div>
+                                          </CommandItem>
+                                        );
+                                      })}
+                                    </CommandGroup>
+                                  ))}
+                                </Fragment>
                               ))}
-                            </Fragment>
-                          ))}
-                        </CommandList>
-                      </Command>
-                    </PopoverContent>
-                  </Popover>
-                </div>
-              )}
-
-              {selectedModel === TELKO_OPENWEBUI_MODEL_ID && (
-                <div className="flex flex-col gap-1 text-xs text-muted-foreground max-w-md">
-                  <span className="shrink-0">Base documentaire pour ce modèle :</span>
-                  <Select
-                    value={openwebuiKnowledgeSource}
-                    onValueChange={(v) => {
-                      const next = v === "telko" ? "telko" : "openwebui";
-                      setOpenwebuiKnowledgeSource(next);
-                      persistOpenwebuiKnowledgeSource(next);
-                    }}
-                  >
-                    <SelectTrigger className="h-9 text-xs" aria-label="Source documentaire Open WebUI">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="openwebui" className="text-xs">
-                        Open WebUI (Knowledge / RAG sur l’instance)
-                      </SelectItem>
-                      <SelectItem value="telko" className="text-xs">
-                        Telko (Qdrant — même base que les autres modèles)
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-[10px] leading-snug text-muted-foreground/90">
-                    {openwebuiKnowledgeSource === "openwebui"
-                      ? "Les extraits viennent de la configuration Open WebUI (y compris le paramètre files si renseigné côté serveur)."
-                      : "Les extraits viennent de la base Telko : recherche sémantique, ou @mention pour cibler un document indexé."}
-                  </p>
+                            </CommandList>
+                          </Command>
+                        </PopoverContent>
+                      </Popover>
+                    </div>
+                    {selectedModel === TELKO_OPENWEBUI_MODEL_ID && (
+                      <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5">
+                        <Checkbox
+                          id="telko-openwebui-qdrant-base"
+                          checked={openwebuiKnowledgeSource === "telko"}
+                          onCheckedChange={(checked) => {
+                            const next: OpenwebuiKnowledgeSource = checked === true ? "telko" : "openwebui";
+                            setOpenwebuiKnowledgeSource(next);
+                            persistOpenwebuiKnowledgeSource(next);
+                          }}
+                          className="border-primary"
+                        />
+                        <Label
+                          htmlFor="telko-openwebui-qdrant-base"
+                          className="cursor-pointer text-xs font-normal leading-snug text-muted-foreground peer-disabled:cursor-not-allowed"
+                          title="Décochez pour n’utiliser que la Knowledge / RAG configurée sur l’instance Open WebUI."
+                        >
+                          Base Telko (Qdrant)
+                        </Label>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 

@@ -40,7 +40,7 @@ class ChatBody(BaseModel):
     mentioned_source_ids: list[str] | None = None
     # Fenêtre de contexte du modèle (tokens), ex. champ context_length d’OpenRouter — pour borner le texte @mention.
     model_context_tokens: int | None = None
-    # Uniquement si provider=openwebui : `openwebui` = RAG Knowledge côté instance OW (défaut) ; `telko` = Qdrant Telko.
+    # Uniquement si provider=openwebui : `telko` = Qdrant Telko (défaut) ; `openwebui` = Knowledge / RAG instance OW.
     openwebui_knowledge_source: Literal["openwebui", "telko"] | None = None
 
 
