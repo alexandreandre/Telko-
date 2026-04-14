@@ -3,6 +3,7 @@ Point d'entrée de l'application FastAPI (remplacement des Edge Functions Supaba
 Lance avec : cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
+import asyncio
 import logging
 import os
 
@@ -60,25 +61,29 @@ async def startup():
         ow_model,
     )
     log_openwebui_rag_config_at_startup(logger)
-    try:
-        logger.info("Initialisation du pipeline RAG (Qdrant + OpenRouter)...")
-        _pipeline.init()
-        logger.info("Initialisation du pipeline RAG terminée avec succès.")
-        # Sync Supabase -> Qdrant au démarrage pour que le RAG ait immédiatement
-        # accès aux documents déjà présents dans `knowledge_documents`.
+
+    async def _rag_warmup_background() -> None:
+        """
+        Qdrant + sync Supabase ne bloquent plus le démarrage Cloud Run (cold start).
+        Les routes répondent tout de suite ; init_collection reste aussi déclenchée
+        à la demande (lazy) sur /chat ou /embed-document si cette tâche n’a pas fini.
+        """
         try:
+            logger.info("Arrière-plan — initialisation RAG (Qdrant + collection)...")
+            _pipeline.init()
+            logger.info("Arrière-plan — init Qdrant terminée.")
             count = await sync_supabase_knowledge_to_qdrant(_pipeline)
             logger.info(
-                "Startup — sync Supabase -> Qdrant effectuée (%d document(s) indexé(s)).",
+                "Arrière-plan — sync Supabase -> Qdrant terminée (%d document(s) (ré)indexé(s)).",
                 count,
             )
         except Exception as exc:  # pragma: no cover - dépend de l'infra externe
             logger.exception(
-                "Échec de la sync Supabase -> Qdrant au démarrage (RAG utilisera une collection partielle/vides) : %s",
+                "Arrière-plan — échec init/sync RAG (retry lazy au prochain appel RAG) : %s",
                 exc,
             )
-    except Exception as exc:  # pragma: no cover - dépend de l'infra externe
-        logger.exception("Échec de l'initialisation du pipeline au démarrage : %s", exc)
+
+    asyncio.create_task(_rag_warmup_background())
 
 app.include_router(health.router, tags=["health"])
 app.include_router(chat.router, tags=["chat"])

@@ -30,7 +30,7 @@ export const RELEVANT_MODEL_GUIDE: RelevantModelGuideRow[] = [
     strengths: [
       "Même contrat fonctionnel que l’API OpenAI, clé Bearer gérée dans Open WebUI",
       "Modèle et garde-fous choisis sur votre instance (auto‑hébergée ou dédiée)",
-      "RAG documentaire délégué à Open WebUI (pas de mélange avec la base Qdrant Telko)",
+      "Choix dans l’assistant : base documentaire Open WebUI (Knowledge) ou base Telko (Qdrant, comme les autres modèles)",
     ],
     weaknesses: [
       "Coût et capacités dépendent entièrement de l’infra derrière Open WebUI",

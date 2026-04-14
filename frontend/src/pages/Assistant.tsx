@@ -43,6 +43,13 @@ import { extractDocumentTextViaApi, getKnowledgeFileKind } from "@/lib/knowledge
 import { getApiBaseUrl } from "@/lib/api";
 import { fetchAssistantGameQuestions, type AssistantGameQuestion } from "@/lib/assistantGameQuestions";
 import { partitionModelsForAssistant } from "@/lib/relevantModels";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface MessageMeta {
   provider: string;
@@ -170,6 +177,27 @@ const getChatUrl = () => `${getApiBaseUrl()}/chat`;
 
 const TELKO_OPENWEBUI_MODEL_ID = "telko/openwebui";
 
+const OPENWEBUI_KNOWLEDGE_SOURCE_KEY = "telko_openwebui_knowledge_source";
+type OpenwebuiKnowledgeSource = "openwebui" | "telko";
+
+function readPersistedOpenwebuiKnowledgeSource(): OpenwebuiKnowledgeSource {
+  try {
+    const v = window.localStorage.getItem(OPENWEBUI_KNOWLEDGE_SOURCE_KEY);
+    if (v === "telko" || v === "openwebui") return v;
+  } catch {
+    /* quota / navigation privée */
+  }
+  return "openwebui";
+}
+
+function persistOpenwebuiKnowledgeSource(value: OpenwebuiKnowledgeSource) {
+  try {
+    window.localStorage.setItem(OPENWEBUI_KNOWLEDGE_SOURCE_KEY, value);
+  } catch {
+    /* quota / navigation privée */
+  }
+}
+
 /** Aligné sur le défaut backend si OpenRouter ne fournit pas `context_length`. */
 const DEFAULT_MODEL_CONTEXT_TOKENS = 128_000;
 const CHARS_PER_TOKEN_EST = 2;
@@ -247,6 +275,9 @@ export default function Assistant() {
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [mentionedDocs, setMentionedDocs] = useState<Doc[]>([]);
+  const [openwebuiKnowledgeSource, setOpenwebuiKnowledgeSource] = useState<OpenwebuiKnowledgeSource>(() =>
+    typeof window !== "undefined" ? readPersistedOpenwebuiKnowledgeSource() : "openwebui",
+  );
   const [docCount, setDocCount] = useState(0);
   const [responseTimeMs, setResponseTimeMs] = useState<number>(0);
   const [sendTime, setSendTime] = useState<number>(0);
@@ -506,7 +537,9 @@ export default function Assistant() {
     const modelContextTokens =
       openRouterContextLengthTokens(modelMeta) ?? DEFAULT_MODEL_CONTEXT_TOKENS;
 
-    const useQdrantForMentions = mentionedDocs.length > 0 && selectedModel !== TELKO_OPENWEBUI_MODEL_ID;
+    const useQdrantForMentions =
+      mentionedDocs.length > 0 &&
+      (selectedModel !== TELKO_OPENWEBUI_MODEL_ID || openwebuiKnowledgeSource === "telko");
 
     let hydratedMentionedDocs = mentionedDocs;
 
@@ -654,6 +687,9 @@ export default function Assistant() {
           provider: chatProviderForModel(selectedModel),
           model: selectedModel,
           model_context_tokens: modelContextTokens,
+          ...(selectedModel === TELKO_OPENWEBUI_MODEL_ID
+            ? { openwebui_knowledge_source: openwebuiKnowledgeSource }
+            : {}),
           ...(mentionedSourceIds?.length ? { mentioned_source_ids: mentionedSourceIds } : {}),
         }),
       });
@@ -1269,6 +1305,37 @@ export default function Assistant() {
                       </Command>
                     </PopoverContent>
                   </Popover>
+                </div>
+              )}
+
+              {selectedModel === TELKO_OPENWEBUI_MODEL_ID && (
+                <div className="flex flex-col gap-1 text-xs text-muted-foreground max-w-md">
+                  <span className="shrink-0">Base documentaire pour ce modèle :</span>
+                  <Select
+                    value={openwebuiKnowledgeSource}
+                    onValueChange={(v) => {
+                      const next = v === "telko" ? "telko" : "openwebui";
+                      setOpenwebuiKnowledgeSource(next);
+                      persistOpenwebuiKnowledgeSource(next);
+                    }}
+                  >
+                    <SelectTrigger className="h-9 text-xs" aria-label="Source documentaire Open WebUI">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="openwebui" className="text-xs">
+                        Open WebUI (Knowledge / RAG sur l’instance)
+                      </SelectItem>
+                      <SelectItem value="telko" className="text-xs">
+                        Telko (Qdrant — même base que les autres modèles)
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[10px] leading-snug text-muted-foreground/90">
+                    {openwebuiKnowledgeSource === "openwebui"
+                      ? "Les extraits viennent de la configuration Open WebUI (y compris le paramètre files si renseigné côté serveur)."
+                      : "Les extraits viennent de la base Telko : recherche sémantique, ou @mention pour cibler un document indexé."}
+                  </p>
                 </div>
               )}
 

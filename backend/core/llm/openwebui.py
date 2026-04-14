@@ -11,6 +11,9 @@ from core.llm.base import BaseLLMProvider, LLMProviderError
 _PROVIDER = "openwebui"
 logger = logging.getLogger(__name__)
 
+# Sentinel : `stream(..., files_payload=...)` sans override → utiliser `self.chat_files`.
+_DEFAULT_OPENWEBUI_FILES = object()
+
 
 def build_openwebui_chat_files() -> list[dict[str, str]] | None:
     """
@@ -118,10 +121,20 @@ class OpenWebUIProvider(BaseLLMProvider):
             "Content-Type": "application/json",
         }
 
-    def _payload(self, messages: list[dict], *, stream: bool) -> dict[str, Any]:
+    def _payload(
+        self,
+        messages: list[dict],
+        *,
+        stream: bool,
+        files: Any = _DEFAULT_OPENWEBUI_FILES,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": self.model, "messages": messages, "stream": stream}
-        if self.chat_files:
-            payload["files"] = self.chat_files
+        if files is _DEFAULT_OPENWEBUI_FILES:
+            eff_files = self.chat_files
+        else:
+            eff_files = files
+        if eff_files:
+            payload["files"] = eff_files
         return payload
 
     def _log_payload_diag(self, payload: dict[str, Any]) -> None:
@@ -136,8 +149,8 @@ class OpenWebUIProvider(BaseLLMProvider):
             types,
         )
 
-    async def generate(self, messages: list[dict]) -> str:
-        payload = self._payload(messages, stream=False)
+    async def generate(self, messages: list[dict], *, files_payload: Any = _DEFAULT_OPENWEBUI_FILES) -> str:
+        payload = self._payload(messages, stream=False, files=files_payload)
         self._log_payload_diag(payload)
         try:
             async with httpx.AsyncClient(timeout=self._httpx_timeout()) as client:
@@ -158,9 +171,12 @@ class OpenWebUIProvider(BaseLLMProvider):
         return data["choices"][0]["message"]["content"].strip()
 
     async def stream(
-        self, messages: list[dict]
+        self,
+        messages: list[dict],
+        *,
+        files_payload: Any = _DEFAULT_OPENWEBUI_FILES,
     ) -> AsyncGenerator[tuple[str | None, OpenWebUIUsage | None], None]:
-        payload = self._payload(messages, stream=True)
+        payload = self._payload(messages, stream=True, files=files_payload)
         self._log_payload_diag(payload)
         try:
             async with httpx.AsyncClient(timeout=self._httpx_timeout()) as client:

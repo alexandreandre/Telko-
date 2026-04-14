@@ -297,12 +297,14 @@ class RAGPipeline:
         llm: BaseLLMProvider | None = None,
         mentioned_source_ids: list[str] | None = None,
         model_context_tokens: int | None = None,
+        openwebui_knowledge_source: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
         Interroge le pipeline RAG et yield les tokens au fur et à mesure.
 
           1. Récupère l'historique de la conversation
-          2. Contexte : provider Open Web UI → pas de Qdrant Telko (RAG délégué à l’instance OW) ;
+          2. Contexte : Open WebUI + `openwebui_knowledge_source=openwebui` (défaut) → RAG côté instance OW ;
+             Open WebUI + `telko` → même LLM OW mais contexte Qdrant Telko (@mention ou k=5) ;
              sinon chunks Qdrant pour `mentioned_source_ids` (@mention) ou recherche sémantique (k=5).
           3. Construit les messages au format OpenAI-like avec contexte + historique
           4. Stream via le LLM provider
@@ -310,36 +312,42 @@ class RAGPipeline:
         L'historique est mis à jour après la génération complète.
 
         `model_context_tokens` : fenêtre du modèle (ex. context_length OpenRouter) pour tronquer le texte @mention.
+
+        `openwebui_knowledge_source` : uniquement si le LLM est OpenWebUIProvider — `openwebui` (défaut) ou `telko`.
         """
         history = self._get_history(conversation_id)
 
         active_llm = llm or self._llm
-        # Open Web UI : le RAG documentaire est toujours délégué à l’instance OW (fichiers API + config serveur),
-        # jamais via embeddings / Qdrant Telko (évite mélange de deux bases).
-        openwebui_delegated_rag = isinstance(active_llm, OpenWebUIProvider)
+        raw_ow_src = (openwebui_knowledge_source or "openwebui").strip().lower()
+        if raw_ow_src not in ("openwebui", "telko"):
+            raw_ow_src = "openwebui"
+        # Open Web UI : par défaut RAG délégué à l’instance OW ; si `telko`, on alimente le modèle OW avec Qdrant Telko
+        # et on n’envoie pas le paramètre `files` (évite double RAG).
+        use_openwebui_server_rag = isinstance(active_llm, OpenWebUIProvider) and raw_ow_src == "openwebui"
         n_mention = len([x for x in (mentioned_source_ids or []) if (x or "").strip()])
         ow_files_n = (
             len(getattr(active_llm, "chat_files", None) or [])
             if isinstance(active_llm, OpenWebUIProvider)
             else 0
         )
-        if openwebui_delegated_rag:
+        if use_openwebui_server_rag:
             rag_branch = "openwebui_with_files_param" if ow_files_n else "openwebui_no_files_param"
         elif n_mention:
             rag_branch = "qdrant_fetch_by_mention"
         else:
             rag_branch = "qdrant_semantic_k5"
         logger.info(
-            "Telko diag | rag_request | conv=%s | provider_openwebui=%s | ow_files_entries=%s | "
-            "mentions=%d | branch=%s",
+            "Telko diag | rag_request | conv=%s | provider_openwebui=%s | ow_knowledge_source=%s | "
+            "ow_files_entries=%s | mentions=%d | branch=%s",
             conversation_id,
             isinstance(active_llm, OpenWebUIProvider),
+            raw_ow_src if isinstance(active_llm, OpenWebUIProvider) else None,
             ow_files_n,
             n_mention,
             rag_branch,
         )
 
-        if openwebui_delegated_rag:
+        if use_openwebui_server_rag:
             docs = []
             embed_usage = {}
             context = ""
@@ -478,7 +486,11 @@ class RAGPipeline:
         # usage brut renvoyé par le provider (OpenRouter dans notre cas)
         raw_usage: dict[str, Any] | None = None
         try:
-            async for content, usage in active_llm.stream(messages):  # type: ignore[misc]
+            if isinstance(active_llm, OpenWebUIProvider) and not use_openwebui_server_rag:
+                stream_iter = active_llm.stream(messages, files_payload=[])
+            else:
+                stream_iter = active_llm.stream(messages)
+            async for content, usage in stream_iter:  # type: ignore[misc]
                 if usage:
                     # Dernier chunk de stream : uniquement l'usage
                     raw_usage = dict(usage)

@@ -464,6 +464,54 @@ class QdrantStore:
             return None
         return str(raw)
 
+    def collect_supabase_revisions_by_source(self) -> dict[str, str]:
+        """
+        Parcourt la collection une fois et renvoie metadata.source -> supabase_updated_at
+        (valeurs non vides uniquement). Évite N appels scroll filtrés pendant la sync Supabase.
+        """
+        revisions: dict[str, str] = {}
+        try:
+            self.init_collection()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("collect_supabase_revisions_by_source — init_collection : %s", exc)
+            return revisions
+
+        offset = None
+        try:
+            while True:
+                records, next_offset = self._client.scroll(
+                    collection_name=self._collection,
+                    limit=512,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for r in records:
+                    payload = r.payload or {}
+                    meta = payload.get("metadata")
+                    if not isinstance(meta, dict):
+                        continue
+                    src = meta.get("source")
+                    if not src:
+                        continue
+                    src_s = str(src)
+                    raw = meta.get("supabase_updated_at")
+                    rev_s = str(raw).strip() if raw is not None else ""
+                    if rev_s and src_s not in revisions:
+                        revisions[src_s] = rev_s
+
+                if next_offset is None:
+                    break
+                offset = next_offset
+        except Exception as exc:
+            logger.error("Erreur Qdrant (scroll collect_supabase_revisions_by_source) : %s", exc)
+
+        logger.info(
+            "collect_supabase_revisions_by_source — %d document(s) avec révision Supabase en cache Qdrant.",
+            len(revisions),
+        )
+        return revisions
+
     def get_last_embeddings_usage(self) -> dict[str, Any] | None:
         """
         Expose l'usage du dernier appel /embeddings effectué via OpenRouterEmbeddings.

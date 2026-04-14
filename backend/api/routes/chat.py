@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
+from typing import Literal
+
 from pydantic import BaseModel
 
 from core.llm import get_llm_provider
@@ -38,6 +40,8 @@ class ChatBody(BaseModel):
     mentioned_source_ids: list[str] | None = None
     # Fenêtre de contexte du modèle (tokens), ex. champ context_length d’OpenRouter — pour borner le texte @mention.
     model_context_tokens: int | None = None
+    # Uniquement si provider=openwebui : `openwebui` = RAG Knowledge côté instance OW (défaut) ; `telko` = Qdrant Telko.
+    openwebui_knowledge_source: Literal["openwebui", "telko"] | None = None
 
 
 @router.post("/chat")
@@ -55,6 +59,9 @@ async def chat(body: ChatBody):
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
     run_id = str(uuid4())
+    ow_knowledge_src = None
+    if (body.provider or "").strip().lower() == "openwebui":
+        ow_knowledge_src = body.openwebui_knowledge_source
 
     async def event_stream():
         try:
@@ -76,6 +83,7 @@ async def chat(body: ChatBody):
                 llm=llm,
                 mentioned_source_ids=body.mentioned_source_ids,
                 model_context_tokens=body.model_context_tokens,
+                openwebui_knowledge_source=ow_knowledge_src,
             ):
                 if not isinstance(item, dict):
                     # Compat backward si d'autres implémentations renvoient encore un str

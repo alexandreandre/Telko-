@@ -78,6 +78,19 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
 
             logger.info("Supabase a renvoyé %d document(s) à vérifier.", len(rows))
 
+            store = pipeline._store  # type: ignore[attr-defined]
+            try:
+                qdrant_revs = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    store.collect_supabase_revisions_by_source,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "sync_supabase_knowledge_to_qdrant — lecture index révisions Qdrant : %s",
+                    exc,
+                )
+                qdrant_revs = {}
+
             for row in rows:
                 doc_id = row.get("id")
                 content = (row.get("content") or "").strip()
@@ -92,21 +105,7 @@ async def sync_supabase_knowledge_to_qdrant(pipeline: RAGPipeline) -> int:
                     continue
 
                 source_id = f"supabase:{doc_id}"
-
-                store = pipeline._store  # type: ignore[attr-defined]
-                try:
-                    stored_rev = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        store.get_stored_supabase_updated_at,
-                        source_id,
-                    )
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(
-                        "sync_supabase_knowledge_to_qdrant — lecture révision Qdrant '%s' : %s",
-                        source_id,
-                        exc,
-                    )
-                    stored_rev = None
+                stored_rev = qdrant_revs.get(source_id)
 
                 if stored_rev is not None and updated_at_s and stored_rev == updated_at_s:
                     skipped_up_to_date += 1
