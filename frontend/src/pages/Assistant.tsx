@@ -43,6 +43,13 @@ import { extractDocumentTextViaApi, getKnowledgeFileKind } from "@/lib/knowledge
 import { getApiBaseUrl } from "@/lib/api";
 import { fetchAssistantGameQuestions, type AssistantGameQuestion } from "@/lib/assistantGameQuestions";
 import { partitionModelsForAssistant } from "@/lib/relevantModels";
+import {
+  type OpenwebuiKnowledgeSource,
+  nextSourceAfterOpenwebuiCheckbox,
+  nextSourceAfterTelkoCheckbox,
+  persistOpenwebuiKnowledgeSource,
+  readPersistedOpenwebuiKnowledgeSource,
+} from "@/lib/openwebuiDocumentSource";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 
@@ -171,27 +178,6 @@ function formatPricingPer1mUsd(
 const getChatUrl = () => `${getApiBaseUrl()}/chat`;
 
 const TELKO_OPENWEBUI_MODEL_ID = "telko/openwebui";
-
-const OPENWEBUI_KNOWLEDGE_SOURCE_KEY = "telko_openwebui_knowledge_source";
-type OpenwebuiKnowledgeSource = "openwebui" | "telko";
-
-function readPersistedOpenwebuiKnowledgeSource(): OpenwebuiKnowledgeSource {
-  try {
-    const v = window.localStorage.getItem(OPENWEBUI_KNOWLEDGE_SOURCE_KEY);
-    if (v === "telko" || v === "openwebui") return v;
-  } catch {
-    /* quota / navigation privée */
-  }
-  return "telko";
-}
-
-function persistOpenwebuiKnowledgeSource(value: OpenwebuiKnowledgeSource) {
-  try {
-    window.localStorage.setItem(OPENWEBUI_KNOWLEDGE_SOURCE_KEY, value);
-  } catch {
-    /* quota / navigation privée */
-  }
-}
 
 /** Aligné sur le défaut backend si OpenRouter ne fournit pas `context_length`. */
 const DEFAULT_MODEL_CONTEXT_TOKENS = 128_000;
@@ -1304,24 +1290,47 @@ export default function Assistant() {
                       </Popover>
                     </div>
                     {selectedModel === TELKO_OPENWEBUI_MODEL_ID && (
-                      <div className="flex shrink-0 items-center gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-1.5">
-                        <Checkbox
-                          id="telko-openwebui-qdrant-base"
-                          checked={openwebuiKnowledgeSource === "telko"}
-                          onCheckedChange={(checked) => {
-                            const next: OpenwebuiKnowledgeSource = checked === true ? "telko" : "openwebui";
-                            setOpenwebuiKnowledgeSource(next);
-                            persistOpenwebuiKnowledgeSource(next);
-                          }}
-                          className="border-primary"
-                        />
-                        <Label
-                          htmlFor="telko-openwebui-qdrant-base"
-                          className="cursor-pointer text-xs font-normal leading-snug text-muted-foreground peer-disabled:cursor-not-allowed"
-                          title="Décochez pour n’utiliser que la Knowledge / RAG configurée sur l’instance Open WebUI."
-                        >
-                          Base documentaire de l'interface (la même que les autres modèles)
-                        </Label>
+                      <div
+                        className="flex shrink-0 flex-col gap-2 rounded-md border border-border bg-muted/30 px-2.5 py-2"
+                        role="group"
+                        aria-label="Source documentaire pour Telko OpenWebUI"
+                      >
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id="telko-openwebui-source-telko"
+                            checked={openwebuiKnowledgeSource === "telko"}
+                            onCheckedChange={(checked) => {
+                              const next = nextSourceAfterTelkoCheckbox(checked);
+                              setOpenwebuiKnowledgeSource(next);
+                              persistOpenwebuiKnowledgeSource(next);
+                            }}
+                            className="border-primary"
+                          />
+                          <Label
+                            htmlFor="telko-openwebui-source-telko"
+                            className="cursor-pointer text-xs font-normal leading-snug text-muted-foreground peer-disabled:cursor-not-allowed"
+                          >
+                            Base Telko (Qdrant, comme les autres modèles)
+                          </Label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id="telko-openwebui-source-openwebui"
+                            checked={openwebuiKnowledgeSource === "openwebui"}
+                            onCheckedChange={(checked) => {
+                              const next = nextSourceAfterOpenwebuiCheckbox(checked);
+                              setOpenwebuiKnowledgeSource(next);
+                              persistOpenwebuiKnowledgeSource(next);
+                            }}
+                            className="border-primary"
+                          />
+                          <Label
+                            htmlFor="telko-openwebui-source-openwebui"
+                            className="cursor-pointer text-xs font-normal leading-snug text-muted-foreground peer-disabled:cursor-not-allowed"
+                          >
+                            Base Open WebUI (Knowledge sur l’instance)
+                          </Label>
+                        </div>
                       </div>
                     )}
                   </div>
