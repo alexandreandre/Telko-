@@ -12,12 +12,10 @@ from fastapi import APIRouter, HTTPException
 
 from config import settings
 from core.llm import get_llm_provider, list_providers
+from core.llm.openwebui import TELKO_OPENWEBUI_CATALOG_ID
 from core.llm_stats import build_usage_aggregates
 
 router = APIRouter(prefix="/llm")
-
-# ID stable côté Telko (sélecteur assistant + comparateur + stats) — le nom réel du modèle Open WebUI reste dans OPENWEBUI_MODEL.
-TELKO_OPENWEBUI_CATALOG_ID = "telko/openwebui"
 
 
 def _telko_openwebui_configured() -> bool:

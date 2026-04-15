@@ -8,6 +8,9 @@ import httpx
 from config import settings
 from core.llm.base import BaseLLMProvider, LLMProviderError
 
+# Identifiant stable Telko (sélecteur, comparateur, agrégats) — distinct du nom de modèle OW (`OPENWEBUI_MODEL`).
+TELKO_OPENWEBUI_CATALOG_ID = "telko/openwebui"
+
 _PROVIDER = "openwebui"
 logger = logging.getLogger(__name__)
 

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Tuple
 import httpx
 
 from config import settings
+from core.llm.openwebui import TELKO_OPENWEBUI_CATALOG_ID
 
 
 logger = logging.getLogger(__name__)
@@ -357,6 +358,16 @@ def record_llm_run(meta: Dict[str, Any]) -> None:
     _insert_run_supabase(payload)
 
 
+def _comparator_usage_model_key(run: LLMRun) -> str:
+    """
+    Clé d’agrégation pour le comparateur : tout run `provider=openwebui` sous l’ID catalogue Telko,
+    pour éviter une ligne par nom de modèle OW (`OPENWEBUI_MODEL`) et une autre pour `telko/openwebui`.
+    """
+    if (run.provider or "").strip().lower() == "openwebui":
+        return TELKO_OPENWEBUI_CATALOG_ID
+    return run.model or settings.openrouter_llm_model
+
+
 def _rated_stats_from_runs(model_runs: List[LLMRun]) -> tuple[int, float | None, str]:
     """(nombre de runs notés, satisfaction %, provider)."""
     rated = [r for r in model_runs if r.rating is not None]
@@ -386,7 +397,7 @@ def build_usage_aggregates(
     feedback_stats: list[dict[str, Any]] = []
     by_model_runs: dict[str, list[LLMRun]] = defaultdict(list)
     for r in runs:
-        key = r.model or settings.openrouter_llm_model
+        key = _comparator_usage_model_key(r)
         by_model_runs[key].append(r)
 
     for mid, mruns in by_model_runs.items():
@@ -418,7 +429,7 @@ def build_usage_aggregates(
 
     by_model: dict[str, list[LLMRun]] = defaultdict(list)
     for r in runs:
-        key = r.model or settings.openrouter_llm_model
+        key = _comparator_usage_model_key(r)
         by_model[key].append(r)
 
     catalog_index: dict[str, Dict[str, Any]] = {m.get("id"): m for m in model_catalog}

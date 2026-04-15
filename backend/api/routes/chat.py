@@ -15,6 +15,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from core.llm import get_llm_provider
+from core.llm.openwebui import TELKO_OPENWEBUI_CATALOG_ID
 from core.pipeline_instance import get_pipeline
 from core.llm_stats import record_llm_run
 
@@ -73,6 +74,9 @@ async def chat(body: ChatBody):
             resolved_model = getattr(llm, "model", None)
             if not isinstance(resolved_model, str) or not resolved_model.strip():
                 resolved_model = body.model or ""
+            if (body.provider or "").strip().lower() == "openwebui":
+                # Même ligne comparateur que l’entrée catalogue `telko/openwebui` (pas le nom OW brut, ex. `telko`).
+                resolved_model = TELKO_OPENWEBUI_CATALOG_ID
 
             async for item in pipeline.stream_query(
                 message=message,
