@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -8,7 +8,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { FileText, Upload, Trash2, Loader2, Search, BookOpen, Download } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
@@ -18,13 +25,24 @@ import { getApiBaseUrl } from "@/lib/api";
 import {
   extractDocumentTextViaApi,
   getKnowledgeFileKind,
-  isAllowedKnowledgeUpload,
   KNOWLEDGE_UPLOAD_ACCEPT,
   knowledgeFileKindLabel,
   knowledgeFileLucideIcon,
   suggestedDownloadFilename,
 } from "@/lib/knowledge-files";
 import { extractPdfText } from "@/lib/pdf-text";
+import {
+  collectFilesFromDataTransfer,
+  dedupeRawKnowledgeFiles,
+  filterBatchKnowledgeFiles,
+  KNOWLEDGE_MAX_BATCH_FILES,
+  knowledgeDocumentDisplayTitle,
+} from "@/lib/knowledge-batch-upload";
+import { cn } from "@/lib/utils";
+import {
+  collectFilesWithDirectoryPicker,
+  isDirectoryPickerSupported,
+} from "@/lib/knowledge-directory-picker";
 
 interface KnowledgeDoc {
   id: string;
@@ -52,6 +70,14 @@ export default function KnowledgeBase() {
   const [searchQuery, setSearchQuery] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadBatchProgress, setUploadBatchProgress] = useState<{
+    done: number;
+    total: number;
+    currentName: string | null;
+  } | null>(null);
+  const [folderImportOpen, setFolderImportOpen] = useState(false);
+  const [folderDialogBusy, setFolderDialogBusy] = useState(false);
+  const folderFallbackInputRef = useRef<HTMLInputElement>(null);
   const [openDoc, setOpenDoc] = useState<OpenDocState | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
 
@@ -297,75 +323,190 @@ export default function KnowledgeBase() {
 
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !user) return;
+  const ingestOneKnowledgeFile = async (file: File, token: string, userId: string) => {
+    let extractedContent: string;
+    if (getKnowledgeFileKind(file.name) === "pdf") {
+      extractedContent = await extractPdfText(file);
+    } else {
+      extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+    }
+    if (!extractedContent.trim()) {
+      throw new Error("Aucun texte exploitable détecté dans ce fichier.");
+    }
 
-    if (!isAllowedKnowledgeUpload(file)) {
+    const leaf = file.name.split(/[/\\]/).pop() || file.name;
+    const safeLeaf = leaf.replace(/[^\w.-]+/g, "_").slice(0, 120) || "document";
+    const filePath = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 11)}-${safeLeaf}`;
+
+    const { error: uploadError } = await supabase.storage.from("knowledge-files").upload(filePath, file);
+    if (uploadError) throw uploadError;
+
+    const title = knowledgeDocumentDisplayTitle(file);
+
+    const apiBase = getApiBaseUrl();
+    const resp = await fetch(`${apiBase}/embed-document`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        title,
+        content: extractedContent,
+        source_type: "file",
+        file_path: filePath,
+      }),
+    });
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => ({}));
+      throw new Error((errBody as { error?: string }).error || resp.statusText);
+    }
+  };
+
+  const processKnowledgeUploadBatch = async (rawFiles: File[]) => {
+    if (!user || rawFiles.length === 0) return;
+
+    const uniqueRaw = dedupeRawKnowledgeFiles(rawFiles);
+    const files = filterBatchKnowledgeFiles(uniqueRaw);
+    if (files.length === 0) {
       toast({
-        title: "Format non supporté",
+        title: "Aucun fichier valide",
         description:
-          "Formats acceptés : PDF, Word (.doc, .docx), Excel (.xls, .xlsx), PowerPoint (.ppt, .pptx). Vérifiez aussi le type MIME si votre navigateur le signale.",
+          "Formats acceptés : PDF, Word, Excel, PowerPoint. Les autres fichiers du dossier ont été ignorés.",
         variant: "destructive",
       });
       return;
     }
 
+    if (files.length > KNOWLEDGE_MAX_BATCH_FILES) {
+      toast({
+        title: "Trop de fichiers",
+        description: `Limite : ${KNOWLEDGE_MAX_BATCH_FILES} documents par import. Réduisez le dossier ou importez en plusieurs fois.`,
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (uniqueRaw.length > files.length) {
+      toast({
+        title: "Fichiers filtrés",
+        description: `${files.length} document(s) retenu(s) sur ${uniqueRaw.length} (métadonnées macOS « ._ », verrous Office « ~$ », formats non supportés, etc.).`,
+      });
+    }
+
     setIsUploading(true);
+    setUploadBatchProgress({ done: 0, total: files.length, currentName: files[0]?.name ?? null });
+
     try {
       const { data: sess } = await supabase.auth.getSession();
       const token = sess.session?.access_token;
       if (!token) throw new Error("Session requise pour indexer un document.");
 
-      let extractedContent: string;
-      if (getKnowledgeFileKind(file.name) === "pdf") {
-        extractedContent = await extractPdfText(file);
+      let ok = 0;
+      const failures: string[] = [];
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setUploadBatchProgress({ done: i, total: files.length, currentName: file.name });
+        try {
+          await ingestOneKnowledgeFile(file, token, user.id);
+          ok++;
+        } catch (err) {
+          console.error(err);
+          const msg = err instanceof Error ? err.message : "Erreur";
+          failures.push(`${file.name} — ${msg}`);
+        }
+      }
+
+      setUploadBatchProgress(null);
+
+      if (ok === files.length) {
+        toast({
+          title: ok === 1 ? "Document ajouté" : "Import terminé",
+          description:
+            ok === 1
+              ? `${files[0].name} a été indexé.`
+              : `${ok} document(s) indexé(s) avec succès.`,
+        });
+      } else if (ok > 0) {
+        toast({
+          title: "Import partiel",
+          description: `${ok} réussi(s), ${failures.length} échec(s). ${failures.slice(0, 3).join(" · ")}${failures.length > 3 ? "…" : ""}`,
+          variant: "destructive",
+        });
       } else {
-        extractedContent = await extractDocumentTextViaApi(file, file.name, token);
-      }
-      if (!extractedContent.trim()) {
-        throw new Error("Aucun texte exploitable détecté dans ce fichier.");
-      }
-
-      const filePath = `${user.id}/${Date.now()}-${file.name}`;
-      const { error: uploadError } = await supabase.storage
-        .from("knowledge-files")
-        .upload(filePath, file);
-      if (uploadError) throw uploadError;
-
-      const title = file.name.replace(/\.[^.]+$/, "");
-
-      const apiBase = getApiBaseUrl();
-      const resp = await fetch(`${apiBase}/embed-document`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          title,
-          content: extractedContent,
-          source_type: "file",
-          file_path: filePath,
-        }),
-      });
-      if (!resp.ok) {
-        const errBody = await resp.json().catch(() => ({}));
-        throw new Error((errBody as { error?: string }).error || resp.statusText);
+        toast({
+          title: "Échec de l’import",
+          description: failures[0] ?? "Impossible d’indexer les fichiers.",
+          variant: "destructive",
+        });
       }
 
-      toast({ title: "Document ajouté", description: `${file.name} a été indexé avec son contenu texte.` });
       loadDocuments();
     } catch (e) {
       console.error(e);
+      setUploadBatchProgress(null);
       toast({
         title: "Erreur",
-        description: e instanceof Error ? e.message : "Impossible d'uploader le fichier.",
+        description: e instanceof Error ? e.message : "Impossible d’uploader les fichiers.",
         variant: "destructive",
       });
     }
+
     setIsUploading(false);
+  };
+
+  const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list = e.target.files;
+    if (!list?.length) return;
+    await processKnowledgeUploadBatch(Array.from(list));
     e.target.value = "";
+  };
+
+  const handleFolderFallbackInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list = e.target.files;
+    if (!list?.length) return;
+    setFolderImportOpen(false);
+    await processKnowledgeUploadBatch(Array.from(list));
+    e.target.value = "";
+  };
+
+  const runFolderImportWithDirectoryPicker = async () => {
+    setFolderDialogBusy(true);
+    try {
+      const raw = await collectFilesWithDirectoryPicker();
+      setFolderImportOpen(false);
+      await processKnowledgeUploadBatch(raw);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      console.error(e);
+      toast({
+        title: "Impossible de lire le dossier",
+        description: e instanceof Error ? e.message : "Réessaie ou utilise le glisser-déposer.",
+        variant: "destructive",
+      });
+    } finally {
+      setFolderDialogBusy(false);
+    }
+  };
+
+  const handleDropZoneDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      const raw = await collectFilesFromDataTransfer(e.dataTransfer);
+      await processKnowledgeUploadBatch(raw);
+    } catch (err) {
+      console.error(err);
+      toast({
+        title: "Lecture du dossier impossible",
+        description:
+          err instanceof Error
+            ? err.message
+            : "Votre navigateur ne permet peut‑être pas le dépôt de dossiers. Essayez « Choisir un dossier ».",
+        variant: "destructive",
+      });
+    }
   };
 
   const deleteDocument = async (docId: string, ev: React.MouseEvent) => {
@@ -397,26 +538,127 @@ export default function KnowledgeBase() {
               Base documentaire
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Uploadez des PDF ou des documents Office (Word, Excel, PowerPoint) pour enrichir l&apos;assistant IA.
+              Uploadez des PDF ou des documents Office (Word, Excel, PowerPoint). Plusieurs fichiers, un dossier
+              entier ou un glisser-déposer sont pris en charge.
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <label>
               <input
                 type="file"
                 className="hidden"
+                multiple
                 accept={KNOWLEDGE_UPLOAD_ACCEPT}
-                onChange={handleFileUpload}
+                onChange={handleFileInputChange}
                 disabled={isUploading}
               />
-              <Button asChild disabled={isUploading}>
+              <Button asChild disabled={isUploading} variant="default">
                 <span className="cursor-pointer">
                   {isUploading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
-                  Uploader un document
+                  Fichier(s)
                 </span>
               </Button>
             </label>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={isUploading}
+              onClick={() => setFolderImportOpen(true)}
+            >
+              Choisir un dossier
+            </Button>
           </div>
+        </div>
+
+        <Dialog open={folderImportOpen} onOpenChange={setFolderImportOpen}>
+          <DialogContent className="sm:max-w-md" onPointerDownOutside={(ev) => folderDialogBusy && ev.preventDefault()}>
+            <DialogHeader>
+              <DialogTitle>Importer un dossier</DialogTitle>
+              <DialogDescription>
+                Seuls les PDF et documents Office (Word, Excel, PowerPoint) sont indexés ; le reste est ignoré
+                automatiquement.
+              </DialogDescription>
+            </DialogHeader>
+            {isDirectoryPickerSupported() ? (
+              <p className="text-sm text-muted-foreground">
+                Tu ouvriras le sélecteur de dossier du système (pas la fenêtre « importer des fichiers sur le site » du
+                navigateur). Tu peux annuler à tout moment.
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                Ce navigateur n’expose pas la sélection de dossier moderne : utilise le bouton ci-dessous — une
+                confirmation du navigateur peut encore s’afficher — ou glisse-dépose un dossier sur la zone en pointillés.
+              </p>
+            )}
+            <input
+              ref={folderFallbackInputRef}
+              type="file"
+              className="hidden"
+              // @ts-expect-error sélection d’arborescence (repli navigateurs sans showDirectoryPicker)
+              webkitdirectory=""
+              // @ts-expect-error complément pour certains navigateurs
+              directory=""
+              multiple
+              onChange={handleFolderFallbackInputChange}
+              disabled={isUploading || folderDialogBusy}
+            />
+            <DialogFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
+              <Button type="button" variant="outline" onClick={() => setFolderImportOpen(false)} disabled={folderDialogBusy}>
+                Annuler
+              </Button>
+              {isDirectoryPickerSupported() ? (
+                <Button
+                  type="button"
+                  onClick={() => void runFolderImportWithDirectoryPicker()}
+                  disabled={isUploading || folderDialogBusy}
+                >
+                  {folderDialogBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Parcourir le dossier…
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  onClick={() => folderFallbackInputRef.current?.click()}
+                  disabled={isUploading || folderDialogBusy}
+                >
+                  Ouvrir le sélecteur du navigateur
+                </Button>
+              )}
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <div
+          className={cn(
+            "flex min-h-[100px] flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-muted-foreground/25 bg-muted/20 px-4 py-6 text-center text-sm text-muted-foreground transition-colors",
+            !isUploading && "hover:border-muted-foreground/40 hover:bg-muted/30",
+            isUploading && "pointer-events-none opacity-70",
+          )}
+          onDragOver={(ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+          }}
+          onDrop={handleDropZoneDrop}
+        >
+          {uploadBatchProgress ? (
+            <>
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+              <p className="font-medium text-foreground">
+                Indexation {uploadBatchProgress.done + 1} / {uploadBatchProgress.total}
+              </p>
+              {uploadBatchProgress.currentName ? (
+                <p className="max-w-full truncate text-xs">{uploadBatchProgress.currentName}</p>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <Upload className="h-5 w-5 opacity-60" />
+              <p>
+                <span className="font-medium text-foreground">Glissez-déposez ici</span> des fichiers ou un dossier
+                complet (jusqu’à {KNOWLEDGE_MAX_BATCH_FILES} documents par import).
+              </p>
+            </>
+          )}
         </div>
 
         <div className="relative">
