@@ -35,6 +35,12 @@ export function extensionFromFilename(name: string): string {
   return name.slice(i).toLowerCase();
 }
 
+export function exceedsKnowledgeApiUploadLimit(file: Pick<File, "name" | "size">): boolean {
+  // Les .pptx sont extraits côté navigateur, sans passer par l'API d'extraction.
+  if (extensionFromFilename(file.name) === ".pptx") return false;
+  return file.size > KNOWLEDGE_API_UPLOAD_MAX_BYTES;
+}
+
 export function isAllowedKnowledgeExtension(name: string): boolean {
   return KNOWLEDGE_EXTENSIONS.has(extensionFromFilename(name));
 }
@@ -132,14 +138,22 @@ export async function extractDocumentTextViaApi(
 
   const form = new FormData();
   form.append("file", file, filename.split("/").pop() || filename);
-  let resp: Response;
-  try {
-    resp = await fetch(`${getApiBaseUrl()}/extract-document-text`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${accessToken}` },
-      body: form,
-    });
-  } catch {
+  let resp: Response | null = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      resp = await fetch(`${getApiBaseUrl()}/extract-document-text`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        body: form,
+      });
+      break;
+    } catch (err) {
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
+    }
+  }
+  if (!resp) {
     throw new Error(
       `Impossible d'envoyer ${filename}. Vérifiez la connexion réseau ou réduisez la taille du document avant import.`,
     );

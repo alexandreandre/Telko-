@@ -23,8 +23,8 @@ import ReactMarkdown from "react-markdown";
 import jsPDF from "jspdf";
 import { getApiBaseUrl } from "@/lib/api";
 import {
+  exceedsKnowledgeApiUploadLimit,
   extractDocumentTextViaApi,
-  extensionFromFilename,
   getKnowledgeFileKind,
   KNOWLEDGE_API_UPLOAD_MAX_BYTES,
   KNOWLEDGE_UPLOAD_ACCEPT,
@@ -333,11 +333,25 @@ export default function KnowledgeBase() {
       try {
         extractedContent = await extractPdfText(file);
       } catch {
-        // Fallback API si le worker PDF du navigateur échoue en production.
-        extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+        try {
+          // Fallback API si le parsing PDF côté navigateur échoue.
+          extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+        } catch {
+          // Dernier recours : on conserve le fichier et on indexe un placeholder
+          // pour éviter un échec complet d'import en cas de panne réseau backend.
+          extractedContent = `[Fichier PDF: ${file.name}]`;
+        }
       }
     } else if (kind === "pptx") {
-      extractedContent = await extractPptxText(file);
+      try {
+        extractedContent = await extractPptxText(file);
+      } catch {
+        try {
+          extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+        } catch {
+          extractedContent = `[Fichier PowerPoint: ${file.name}]`;
+        }
+      }
     } else {
       extractedContent = await extractDocumentTextViaApi(file, file.name, token);
     }
@@ -398,11 +412,7 @@ export default function KnowledgeBase() {
       return;
     }
 
-    const oversized = files.find((f) => {
-      // Les .pptx sont parsés côté navigateur, donc pas limités par l'endpoint backend.
-      if (extensionFromFilename(f.name) === ".pptx") return false;
-      return f.size > KNOWLEDGE_API_UPLOAD_MAX_BYTES;
-    });
+    const oversized = files.find((f) => exceedsKnowledgeApiUploadLimit(f));
     if (oversized) {
       const sizeMb = (oversized.size / (1024 * 1024)).toFixed(1);
       const limitMb = (KNOWLEDGE_API_UPLOAD_MAX_BYTES / (1024 * 1024)).toFixed(0);
