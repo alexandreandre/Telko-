@@ -24,13 +24,16 @@ import jsPDF from "jspdf";
 import { getApiBaseUrl } from "@/lib/api";
 import {
   extractDocumentTextViaApi,
+  extensionFromFilename,
   getKnowledgeFileKind,
+  KNOWLEDGE_API_UPLOAD_MAX_BYTES,
   KNOWLEDGE_UPLOAD_ACCEPT,
   knowledgeFileKindLabel,
   knowledgeFileLucideIcon,
   suggestedDownloadFilename,
 } from "@/lib/knowledge-files";
 import { extractPdfText } from "@/lib/pdf-text";
+import { extractPptxText } from "@/lib/pptx-text";
 import {
   collectFilesFromDataTransfer,
   dedupeRawKnowledgeFiles,
@@ -325,8 +328,16 @@ export default function KnowledgeBase() {
 
   const ingestOneKnowledgeFile = async (file: File, token: string, userId: string) => {
     let extractedContent: string;
-    if (getKnowledgeFileKind(file.name) === "pdf") {
-      extractedContent = await extractPdfText(file);
+    const kind = getKnowledgeFileKind(file.name);
+    if (kind === "pdf") {
+      try {
+        extractedContent = await extractPdfText(file);
+      } catch {
+        // Fallback API si le worker PDF du navigateur échoue en production.
+        extractedContent = await extractDocumentTextViaApi(file, file.name, token);
+      }
+    } else if (kind === "pptx") {
+      extractedContent = await extractPptxText(file);
     } else {
       extractedContent = await extractDocumentTextViaApi(file, file.name, token);
     }
@@ -382,6 +393,22 @@ export default function KnowledgeBase() {
       toast({
         title: "Trop de fichiers",
         description: `Limite : ${KNOWLEDGE_MAX_BATCH_FILES} documents par import. Réduisez le dossier ou importez en plusieurs fois.`,
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const oversized = files.find((f) => {
+      // Les .pptx sont parsés côté navigateur, donc pas limités par l'endpoint backend.
+      if (extensionFromFilename(f.name) === ".pptx") return false;
+      return f.size > KNOWLEDGE_API_UPLOAD_MAX_BYTES;
+    });
+    if (oversized) {
+      const sizeMb = (oversized.size / (1024 * 1024)).toFixed(1);
+      const limitMb = (KNOWLEDGE_API_UPLOAD_MAX_BYTES / (1024 * 1024)).toFixed(0);
+      toast({
+        title: "Fichier trop volumineux",
+        description: `${oversized.name} fait ${sizeMb} Mo. Limite actuelle : ${limitMb} Mo par document.`,
         variant: "destructive",
       });
       return;

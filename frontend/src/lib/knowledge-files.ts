@@ -3,6 +3,8 @@ import { FileSpreadsheet, FileText, FileType2, Presentation } from "lucide-react
 
 import { getApiBaseUrl } from "@/lib/api";
 
+export const KNOWLEDGE_API_UPLOAD_MAX_BYTES = 30 * 1024 * 1024;
+
 /** Valeur de l'attribut `accept` pour l'input fichier (base documentaire). */
 export const KNOWLEDGE_UPLOAD_ACCEPT =
   ".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation";
@@ -120,13 +122,28 @@ export async function extractDocumentTextViaApi(
   filename: string,
   accessToken: string,
 ): Promise<string> {
+  if (file.size > KNOWLEDGE_API_UPLOAD_MAX_BYTES) {
+    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+    const limitMb = (KNOWLEDGE_API_UPLOAD_MAX_BYTES / (1024 * 1024)).toFixed(0);
+    throw new Error(
+      `Le fichier ${filename} fait ${sizeMb} Mo et dépasse la limite d'import (${limitMb} Mo). Découpez-le ou compressez-le avant import.`,
+    );
+  }
+
   const form = new FormData();
   form.append("file", file, filename.split("/").pop() || filename);
-  const resp = await fetch(`${getApiBaseUrl()}/extract-document-text`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${accessToken}` },
-    body: form,
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(`${getApiBaseUrl()}/extract-document-text`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+      body: form,
+    });
+  } catch {
+    throw new Error(
+      `Impossible d'envoyer ${filename}. Vérifiez la connexion réseau ou réduisez la taille du document avant import.`,
+    );
+  }
   if (!resp.ok) {
     const errBody = await resp.json().catch(() => ({}));
     throw new Error((errBody as { error?: string }).error || resp.statusText);
