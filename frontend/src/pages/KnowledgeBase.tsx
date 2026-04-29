@@ -47,6 +47,13 @@ import {
   isDirectoryPickerSupported,
 } from "@/lib/knowledge-directory-picker";
 
+/** Laisse le navigateur peindre (spinner) avant un traitement lourd sur le fil principal. */
+async function yieldForPaint(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  });
+}
+
 interface KnowledgeDoc {
   id: string;
   title: string;
@@ -77,6 +84,7 @@ export default function KnowledgeBase() {
     done: number;
     total: number;
     currentName: string | null;
+    phase: "reading" | "indexing";
   } | null>(null);
   const [folderImportOpen, setFolderImportOpen] = useState(false);
   const [folderDialogBusy, setFolderDialogBusy] = useState(false);
@@ -326,10 +334,16 @@ export default function KnowledgeBase() {
 
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
 
-  const ingestOneKnowledgeFile = async (file: File, token: string, userId: string) => {
+  const ingestOneKnowledgeFile = async (
+    file: File,
+    token: string,
+    userId: string,
+    onPhase?: (phase: "reading" | "indexing") => void,
+  ) => {
     let extractedContent: string;
     const kind = getKnowledgeFileKind(file.name);
     if (kind === "pdf") {
+      onPhase?.("reading");
       try {
         extractedContent = await extractPdfText(file);
       } catch {
@@ -343,6 +357,7 @@ export default function KnowledgeBase() {
         }
       }
     } else if (kind === "pptx") {
+      onPhase?.("reading");
       try {
         extractedContent = await extractPptxText(file);
       } catch {
@@ -353,11 +368,14 @@ export default function KnowledgeBase() {
         }
       }
     } else {
+      onPhase?.("reading");
       extractedContent = await extractDocumentTextViaApi(file, file.name, token);
     }
     if (!extractedContent.trim()) {
       throw new Error("Aucun texte exploitable détecté dans ce fichier.");
     }
+
+    onPhase?.("indexing");
 
     const leaf = file.name.split(/[/\\]/).pop() || file.name;
     const safeLeaf = leaf.replace(/[^\w.-]+/g, "_").slice(0, 120) || "document";
@@ -432,7 +450,13 @@ export default function KnowledgeBase() {
     }
 
     setIsUploading(true);
-    setUploadBatchProgress({ done: 0, total: files.length, currentName: files[0]?.name ?? null });
+    setUploadBatchProgress({
+      done: 0,
+      total: files.length,
+      currentName: files[0]?.name ?? null,
+      phase: "reading",
+    });
+    await yieldForPaint();
 
     try {
       const { data: sess } = await supabase.auth.getSession();
@@ -444,9 +468,17 @@ export default function KnowledgeBase() {
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        setUploadBatchProgress({ done: i, total: files.length, currentName: file.name });
+        setUploadBatchProgress({
+          done: i,
+          total: files.length,
+          currentName: file.name,
+          phase: "reading",
+        });
+        await yieldForPaint();
         try {
-          await ingestOneKnowledgeFile(file, token, user.id);
+          await ingestOneKnowledgeFile(file, token, user.id, (phase) => {
+            setUploadBatchProgress((prev) => (prev ? { ...prev, phase } : prev));
+          });
           ok++;
         } catch (err) {
           console.error(err);
@@ -681,7 +713,12 @@ export default function KnowledgeBase() {
             <>
               <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
               <p className="font-medium text-foreground">
-                Indexation {uploadBatchProgress.done + 1} / {uploadBatchProgress.total}
+                {uploadBatchProgress.phase === "reading"
+                  ? "Préparation du fichier…"
+                  : "Envoi et indexation…"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Document {uploadBatchProgress.done + 1} / {uploadBatchProgress.total}
               </p>
               {uploadBatchProgress.currentName ? (
                 <p className="max-w-full truncate text-xs">{uploadBatchProgress.currentName}</p>

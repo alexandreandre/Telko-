@@ -45,6 +45,9 @@ backend/.env
 data/
 qdrant_storage/
 
+# Fichiers PPTX de test locaux volumineux (ne pas versionner)
+test-pptx-*.pptx
+
 # Coverage / tests
 .pytest_cache/
 .coverage
